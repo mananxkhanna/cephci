@@ -111,6 +111,58 @@ def _wait_for_mds_daemon_count(
     return 1
 
 
+def _wait_for_orch_host_not_offline(client, hostname: str, timeout: int = 600):
+    """
+    After test SSH is back, mgr can still list the host as offline.
+
+    ``ceph orch ps`` paints ``host is offline`` from mgr ``offline_hosts``.
+    Background refresh skips those hosts. ``--refresh`` forces mgr SSH
+    (cephadm ls); a successful probe clears offline and updates cache.
+
+    Returns:
+        0 when at least one daemon is listed and none have status_desc
+        ``host is offline``, else 1.
+    """
+    end_time = time.time() + timeout
+    last_statuses = []
+    while time.time() < end_time:
+        out, _ = client.exec_command(
+            sudo=True,
+            cmd=f"ceph orch ps {hostname} --refresh --format json",
+            check_ec=False,
+        )
+        try:
+            daemons = json.loads(out) if out else []
+        except json.JSONDecodeError:
+            daemons = []
+        if not isinstance(daemons, list):
+            daemons = []
+        last_statuses = [
+            (d.get("daemon_id"), d.get("status_desc")) for d in daemons
+        ]
+        offline = [d for d in daemons if d.get("status_desc") == "host is offline"]
+        if daemons and not offline:
+            log.info(
+                "Orch host %s is no longer offline after refresh; daemons=%s",
+                hostname,
+                last_statuses,
+            )
+            return 0
+        log.info(
+            "Orch host %s still offline or empty after refresh: %s",
+            hostname,
+            last_statuses,
+        )
+        time.sleep(10)
+    log.error(
+        "Orch host %s still offline after %ss: %s",
+        hostname,
+        timeout,
+        last_statuses,
+    )
+    return 1
+
+
 def _validate_metrics(
     stage: str,
     helper: MDSMetricsHelper,
@@ -431,6 +483,12 @@ def run(ceph_cluster, **kw):
                 raise RuntimeError("Active MDS node not found for reboot operation")
             fs_util.reboot_node(ceph_node=active_mds_node)
             log.info("Rebooted active MDS node: %s", active_host)
+            # Test SSH is back; orch may still show host is offline until mgr
+            # SSH succeeds. --refresh forces that probe before remove-add.
+            if _wait_for_orch_host_not_offline(client, active_host):
+                raise RuntimeError(
+                    f"Orch still reports host {active_host} offline after reboot"
+                )
 
         def _remove_add_mds_service():
             out, _ = client.exec_command(
