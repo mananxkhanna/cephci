@@ -137,9 +137,7 @@ def _wait_for_orch_host_not_offline(client, hostname: str, timeout: int = 600):
             daemons = []
         if not isinstance(daemons, list):
             daemons = []
-        last_statuses = [
-            (d.get("daemon_id"), d.get("status_desc")) for d in daemons
-        ]
+        last_statuses = [(d.get("daemon_id"), d.get("status_desc")) for d in daemons]
         offline = [d for d in daemons if d.get("status_desc") == "host is offline"]
         if daemons and not offline:
             log.info(
@@ -195,9 +193,7 @@ def _validate_metrics(
         # when there is no active MDS yet, every dump failed, or the dump had
         # no matching metrics (new MDS has not seen IO yet).
         if not results:
-            raise RuntimeError(
-                f"{stage}: metrics dump has no MDS entries (empty dict)"
-            )
+            raise RuntimeError(f"{stage}: metrics dump has no MDS entries (empty dict)")
         # Unlikely with current collect_subvolume_metrics (it does not store
         # empty lists). Kept if a caller ever returns {mds: []}.
         metric_rows = [row for rows in results.values() for row in rows]
