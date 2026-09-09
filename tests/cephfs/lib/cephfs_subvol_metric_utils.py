@@ -158,6 +158,9 @@ class MDSMetricsHelper:
                 flat = self._flatten_subvolume_items(
                     items, fs_filter=fs_name, path_prefix=norm_prefix
                 )
+                # Only store MDS keys that have rows. Empty dump / no path match
+                # is omitted, so the return value can be {} even when MDS was
+                # queried (no active name, dump failed, or no IO in the window).
                 if flat:
                     results[mds_name] = flat
             except Exception as e:
@@ -339,9 +342,7 @@ class MDSMetricsHelper:
             expected_used = self.expected_metrics_used_bytes(
                 last_bu, parent_rbytes_baseline
             )
-            result = self.get_quota_and_used(
-                client, fs_name, subvol_path, ranks=ranks
-            )
+            result = self.get_quota_and_used(client, fs_name, subvol_path, ranks=ranks)
             if result is None:
                 log.info(
                     "used_bytes wait %s/%s: no metrics yet "

@@ -123,20 +123,45 @@ def _validate_metrics(
     log.info("Collecting metrics for stage: %s", stage)
     quota_attrs = fs_util.get_quota_attrs(client, fuse_mount_dir)
     expected_quota_bytes = int(quota_attrs.get("bytes", 0))
-    subvol_metrics = helper.collect_subvolume_metrics(
-        client=client,
-        fs_name=fs_name,
-        role="active",
-        ranks=None,
-        path_prefix=subvol_path,
-    )
+
+    # stage is the op label, e.g. "after MDS node reboot".
+    # After MDS restart/reboot the dump list starts empty until the next write
+    # lands on the new MDS. HEALTH_OK is not that moment, so retry the dump.
+    # @retry: first dump immediately, then every 30s (backoff=1, not 2).
+    # Last try starts at (21 - 1) * 30s = 600s (~10 min).
+    @retry(RuntimeError, tries=21, delay=30, backoff=1)
+    def _wait_for_subvol_metrics():
+        results = helper.collect_subvolume_metrics(
+            client=client,
+            fs_name=fs_name,
+            role="active",
+            ranks=None,
+            path_prefix=subvol_path,
+        )
+        # results is {mds_name: [rows]}. {} does not only mean "no MDS":
+        # collect_subvolume_metrics omits keys with no rows, so {} also happens
+        # when there is no active MDS yet, every dump failed, or the dump had
+        # no matching metrics (new MDS has not seen IO yet).
+        if not results:
+            raise RuntimeError(
+                f"{stage}: metrics dump has no MDS entries (empty dict)"
+            )
+        # Unlikely with current collect_subvolume_metrics (it does not store
+        # empty lists). Kept if a caller ever returns {mds: []}.
+        metric_rows = [row for rows in results.values() for row in rows]
+        if not metric_rows:
+            raise RuntimeError(
+                f"{stage}: dump listed MDS daemon(s) but none had subvolume "
+                "metrics yet (list empty until IO is seen on the new MDS)"
+            )
+        return results
+
+    subvol_metrics = _wait_for_subvol_metrics()
     log.info(
         "%s: expected values from CLI quota_bytes=%s",
         stage,
         expected_quota_bytes,
     )
-    if not subvol_metrics:
-        raise RuntimeError(f"{stage}: subvolume metrics are empty")
 
     found_subvol_item = False
     for mds_name, items in subvol_metrics.items():

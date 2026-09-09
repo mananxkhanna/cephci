@@ -80,7 +80,8 @@ def run(ceph_cluster, **kw):
        capture parent ceph.dir.rbytes as baseline, fill 2G data, verify quota_bytes
        in subvol metrics = 3G and used_bytes == subvolume info bytes_used + baseline.
     2. Remove quota via set_quota_attrs(client, "0", "0", mount_dir);
-       verify quota_bytes in metrics is 0 and used_bytes == bytes_used + baseline.
+       verify quota_bytes in metrics is updated (0 for unlimited) and
+       used_bytes == bytes_used + baseline.
     3. Add 2G more data, then apply quota 5G via set_quota_attrs.
     4. Verify quota_bytes = 5G and used_bytes == bytes_used + baseline.
 
@@ -249,6 +250,8 @@ def run(ceph_cluster, **kw):
         expected_metrics_used = helper.expected_metrics_used_bytes(
             expected_used_bytes, parent_rbytes_baseline
         )
+        # Unlimited quota is typically reported as 0 in Ceph
+        log.info("Step 2: quota_bytes after unlimited = %s", quota_bytes)
         if quota_bytes != 0:
             log.error("Step 2: Expected 0 for unlimited; got %s", quota_bytes)
             return 1
@@ -262,7 +265,9 @@ def run(ceph_cluster, **kw):
             )
             return 1
         log.info(
-            "Step 2 Passed: used_bytes = %s (bytes_used=%s baseline=%s)",
+            "Step 2 Passed: quota_bytes = %s (0 for unlimited), used_bytes = %s "
+            "(bytes_used=%s baseline=%s)",
+            quota_bytes,
             used_bytes,
             expected_used_bytes,
             parent_rbytes_baseline,
