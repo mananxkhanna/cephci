@@ -27,9 +27,46 @@ def _get_unique_mds_hosts(ceph_cluster) -> List[str]:
 
 
 def _wait_for_mds_daemon_count(
-    client, fs_name: str, expected_count: int, timeout: int = 240
+    client,
+    fs_name: str,
+    expected_count: int,
+    timeout: int = 240,
+    match: str = "gte",
 ):
+    """
+    Wait until orch MDS daemons for fs_name satisfy expected_count.
+
+    Only daemons whose id starts with ``{fs_name}.`` and whose
+    ``status_desc`` is ``running`` are counted.
+
+    ``match`` exists because a single ``>= expected_count`` check is wrong
+    for scale-down. After ``ceph orch apply`` shrinks placement (e.g. 3
+    hosts -> 2), 3 daemons may still be running. ``3 >= 2`` would return
+    immediately, the next apply (2 -> 3) would race orch, and add would
+    time out waiting for 3 running MDS.
+
+    Args:
+        client: Ceph client node used to run ``ceph orch ps``.
+        fs_name: Filesystem whose MDS daemons to count.
+        expected_count: Target number of running MDS daemons.
+        timeout: Seconds to poll before giving up (default 240).
+        match: How to compare the running count to expected_count.
+            ``gte`` — ``running >= expected_count``. Use for setup and
+            scale-up: "at least N are up" (placing 3 hosts but only
+            requiring 2 is enough to continue).
+            ``eq`` — ``running == expected_count``. Use after remove so
+            shrink has finished before add, and after add so the count
+            is back to the original placement.
+
+    Returns:
+        0 if the condition matched within timeout, else 1.
+    """
+    if match not in ("gte", "eq"):
+        raise ValueError(f"match must be 'gte' or 'eq', got {match!r}")
+
     end_time = time.time() + timeout
+    last_fs_daemons = []
+    last_running = 0
     while time.time() < end_time:
         out, _ = client.exec_command(
             sudo=True,
@@ -37,15 +74,40 @@ def _wait_for_mds_daemon_count(
             check_ec=False,
         )
         daemons = json.loads(out)
-        running = [
-            d
-            for d in daemons
-            if d.get("daemon_id", "").startswith(f"{fs_name}.")
-            and d.get("status_desc") == "running"
+        fs_daemons = [
+            d for d in daemons if d.get("daemon_id", "").startswith(f"{fs_name}.")
         ]
-        if len(running) >= expected_count:
+        running = [d for d in fs_daemons if d.get("status_desc") == "running"]
+        last_fs_daemons = fs_daemons
+        last_running = len(running)
+        matched = (
+            last_running >= expected_count
+            if match == "gte"
+            else last_running == expected_count
+        )
+        if matched:
+            log.info(
+                "MDS count wait matched: match=%s expected=%s running=%s",
+                match,
+                expected_count,
+                last_running,
+            )
             return 0
+        log.info(
+            "MDS count wait: match=%s expected=%s running=%s statuses=%s",
+            match,
+            expected_count,
+            last_running,
+            [(d.get("daemon_id"), d.get("status_desc")) for d in fs_daemons],
+        )
         time.sleep(10)
+    log.error(
+        "MDS count wait failed: match=%s expected=%s running=%s daemons=%s",
+        match,
+        expected_count,
+        last_running,
+        [(d.get("daemon_id"), d.get("status_desc")) for d in last_fs_daemons],
+    )
     return 1
 
 
@@ -241,6 +303,7 @@ def run(ceph_cluster, **kw):
                 sudo=True,
                 cmd=f"ceph orch apply mds {fs_name} --placement='{len(selected_hosts)} {placement}'",
             )
+            # Default match="gte": placement may be 3 hosts; continue once at least 2 are running.
             if _wait_for_mds_daemon_count(client, fs_name, expected_count=2):
                 raise RuntimeError(
                     "MDS daemons did not reach expected count after placement apply"
@@ -373,8 +436,13 @@ def run(ceph_cluster, **kw):
                 sudo=True,
                 cmd=f"ceph orch apply mds {fs_name} --placement='{len(reduced_hosts)} {reduced_placement}'",
             )
+            # match="eq": wait until running count has actually dropped (not >= reduced).
+            # Otherwise add is issued while 3 MDS are still up and orch races.
             if _wait_for_mds_daemon_count(
-                client, fs_name, expected_count=len(reduced_hosts)
+                client,
+                fs_name,
+                expected_count=len(reduced_hosts),
+                match="eq",
             ):
                 raise RuntimeError("MDS count did not converge after remove operation")
 
@@ -383,8 +451,12 @@ def run(ceph_cluster, **kw):
                 cmd=f"ceph orch apply mds {fs_name} --placement='{len(fs_hosts)} {full_placement}'",
             )
 
+            # match="eq": original host count must be running again before metrics check.
             if _wait_for_mds_daemon_count(
-                client, fs_name, expected_count=len(fs_hosts)
+                client,
+                fs_name,
+                expected_count=len(fs_hosts),
+                match="eq",
             ):
                 out, _ = client.exec_command(
                     sudo=True,
