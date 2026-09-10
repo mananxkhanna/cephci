@@ -324,7 +324,6 @@ tests:
         service_id: nfs-14352-seed
         port: 62100
         monitoring_port: 62600
-        cluster_qos_port: 63100
 
   - test:
       name: NFS rados command timeout default 30s
@@ -339,7 +338,6 @@ tests:
         seed_service_id: nfs-14352-seed
         port: 62110
         monitoring_port: 62610
-        cluster_qos_port: 63110
         expect: 30.0
         get_ok:
           - "30"
@@ -358,7 +356,6 @@ tests:
         seed_service_id: nfs-14352-seed
         port: 62120
         monitoring_port: 62620
-        cluster_qos_port: 63120
         set_value: 60
         expect: 60.0
         get_ok:
@@ -378,7 +375,6 @@ tests:
         seed_service_id: nfs-14352-seed
         port: 62130
         monitoring_port: 62630
-        cluster_qos_port: 63130
         set_value: 5
         expect: 5.0
         get_ok:
@@ -398,7 +394,6 @@ tests:
         seed_service_id: nfs-14352-seed
         port: 62140
         monitoring_port: 62640
-        cluster_qos_port: 63140
         set_value: 0
         expect: 5.0
         get_ok:
