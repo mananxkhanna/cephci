@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 from looseversion import LooseVersion
 
+from ceph.ceph import CommandFailed, SocketTimeoutException
 from tests.cephfs.cephfs_utilsV1 import FsUtils
 from tests.cephfs.lib.cephfs_common_lib import CephFSCommonUtils
 from tests.cephfs.lib.cephfs_subvol_metric_utils import MDSMetricsHelper
@@ -68,12 +69,22 @@ def _wait_for_mds_daemon_count(
     last_fs_daemons = []
     last_running = 0
     while time.time() < end_time:
-        out, _ = client.exec_command(
-            sudo=True,
-            cmd="ceph orch ps --daemon_type=mds --format json",
-            check_ec=False,
-        )
-        daemons = json.loads(out)
+        try:
+            out, _ = client.exec_command(
+                sudo=True,
+                cmd="ceph orch ps --daemon_type=mds --format json",
+                check_ec=False,
+                timeout=60,
+            )
+        except (CommandFailed, SocketTimeoutException):
+            log.info("ceph orch ps MDS list timed out or failed; retrying")
+            out = ""
+        try:
+            daemons = json.loads(out) if out else []
+        except json.JSONDecodeError:
+            daemons = []
+        if not isinstance(daemons, list):
+            daemons = []
         fs_daemons = [
             d for d in daemons if d.get("daemon_id", "").startswith(f"{fs_name}.")
         ]
@@ -119,6 +130,10 @@ def _wait_for_orch_host_not_offline(client, hostname: str, timeout: int = 600):
     Background refresh skips those hosts. ``--refresh`` forces mgr SSH
     (cephadm ls); a successful probe clears offline and updates cache.
 
+    Each ``--refresh`` is capped at 60s so a stuck mgr SSH cannot consume
+    this waiter's 600s budget in a single poll. Timeout raises; catch it and
+    keep polling.
+
     Returns:
         0 when at least one daemon is listed and none have status_desc
         ``host is offline``, else 1.
@@ -126,11 +141,19 @@ def _wait_for_orch_host_not_offline(client, hostname: str, timeout: int = 600):
     end_time = time.time() + timeout
     last_statuses = []
     while time.time() < end_time:
-        out, _ = client.exec_command(
-            sudo=True,
-            cmd=f"ceph orch ps {hostname} --refresh --format json",
-            check_ec=False,
-        )
+        try:
+            out, _ = client.exec_command(
+                sudo=True,
+                cmd=f"ceph orch ps {hostname} --refresh --format json",
+                check_ec=False,
+                timeout=60,
+            )
+        except (CommandFailed, SocketTimeoutException):
+            log.info(
+                "Orch ps --refresh for %s timed out or failed; retrying",
+                hostname,
+            )
+            out = ""
         try:
             daemons = json.loads(out) if out else []
         except json.JSONDecodeError:
@@ -570,7 +593,10 @@ def run(ceph_cluster, **kw):
                 fuse_mount_dir=fuse_mount_dir,
             )
 
-        log.info("All disruptive operations completed.")
+        log.info(
+            "TEST PASSED CEPH-83632428: metrics validated after MDS restart, "
+            "MGR restart, MDS reboot, and MDS remove-add"
+        )
         if stop_event:
             stop_event.set()
         if io_thread and io_thread.is_alive():
