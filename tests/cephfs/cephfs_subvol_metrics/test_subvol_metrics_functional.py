@@ -82,7 +82,7 @@ def run(ceph_cluster, **kw):
     2. Remove quota via set_quota_attrs(client, "0", "0", mount_dir);
        verify quota_bytes in metrics is updated (0 for unlimited) and
        used_bytes == bytes_used + baseline.
-    3. Add 2G more data, then apply quota 5G via set_quota_attrs.
+    3. Apply quota 5G via set_quota_attrs, then add 2G more data.
     4. Verify quota_bytes = 5G and used_bytes == bytes_used + baseline.
 
     Returns 0 on success, 1 on failure.
@@ -273,7 +273,7 @@ def run(ceph_cluster, **kw):
             parent_rbytes_baseline,
         )
 
-        # Step 3: Add 2G more data (total 4G), then apply quota 5G via set_quota_attrs
+        # Step 3: Apply quota 5G, then add 2G more data (total 4G)
         log.info("Step 3: Set quota to 5G on mount, add 2G more data")
 
         log.info("Setting quota on %s: 5G bytes", fuse_mount_dir)
