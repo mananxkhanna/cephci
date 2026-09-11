@@ -52,10 +52,6 @@ Harness (not product):
     health is still polled; other apply CommandFailed Fails immediately.
   * Unique service_id and ports per stall. ``cluster_qos_port`` is
     optional (tentacle); omit it on squid/8.1 NFS specs.
-  * Around every ``config set`` of this option, log ``ceph -s``,
-    ``ceph orch ps``, and ``ceph orch ps --daemon-type mgr --refresh
-    --format json``. Not Pass/Fail; later review from Jenkins whether
-    mgr failed over or restarted.
 """
 
 import json
@@ -164,40 +160,9 @@ def _config_get_timeout(installer):
     return out.strip()
 
 
-def _log_cmd(installer, cmd):
-    """Run ``cmd`` and log stdout/stderr. Never Fail the timeout row."""
-    out, err = _ceph(installer, cmd, check_ec=False)
-    body = "\n".join(p for p in (out, err) if p) or "(empty)"
-    log.info("%s:\n%s", cmd, body)
-
-
-def _log_mgr_snapshots(installer, when, value):
-    """Capture cluster/mgr status around a timeout ``config set``. Log only."""
-    log.info(
-        "MGR SNAPSHOT %s config set %s=%s (not asserted)",
-        when,
-        TIMEOUT_OPTION,
-        value,
-    )
-    _log_cmd(installer, "ceph -s")
-    _log_cmd(installer, "ceph orch ps")
-    _log_cmd(
-        installer,
-        "ceph orch ps --daemon-type mgr --refresh --format json",
-    )
-    log.info(
-        "MGR SNAPSHOT %s end %s=%s",
-        when,
-        TIMEOUT_OPTION,
-        value,
-    )
-
-
 def _config_set_timeout(installer, value):
     log.info("ceph config set mgr %s %s (not config rm)", TIMEOUT_OPTION, value)
-    _log_mgr_snapshots(installer, "before", value)
     _ceph(installer, f"ceph config set mgr {TIMEOUT_OPTION} {value}")
-    _log_mgr_snapshots(installer, "after", value)
 
 
 def _osd_pause(installer, timeout=PAUSE_FLAG_WAIT):
