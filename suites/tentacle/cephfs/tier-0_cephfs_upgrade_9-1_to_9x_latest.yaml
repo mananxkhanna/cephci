@@ -147,7 +147,7 @@ tests:
       config:
         ENABLE_LOGS : 1
         daemon_list : ['mds','client','osd','mgr','mon']
-        daemon_dbg_level : {'mds':10,'client':10,'osd':5,'mgr':5,'mon':5}
+        daemon_dbg_level : {'mds':10,'client':10,'osd':5,'mgr':20,'mon':5}
   - test:
       abort-on-fail: false
       desc: "Set size limit for log rotation"
@@ -156,6 +156,34 @@ tests:
       config:
         LOG_ROTATE_SIZE : 1
         log_size : '200M'
+  - test:
+      abort-on-fail: false
+      desc: "Enable max MGR debug for libcephsqlite/snap_schedule"
+      module: test_cephadm.py
+      name: enable-mgr-max-debug
+      config:
+        steps:
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, log_to_file, "true"]
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, debug_mgr, "20/20"]
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, debug_mgrc, "20/20"]
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, debug_cephsqlite, "20/20"]
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, debug_objecter, "20/20"]
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, debug_rados, "20/20"]
+          - config:
+              command: shell
+              args: [ceph, config, set, mgr, debug_ms, "1"]
   -
     test:
       abort-on-fail: false
