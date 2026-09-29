@@ -145,7 +145,13 @@ def configure_subsystems(nvme_service, ceph_cluster=None, subsystem_config=None)
                 or get_network_mask(nvme_service.gateways)
             )
 
-        gateway.subsystem.add(**{"args": args})
+        try:
+            gateway.subsystem.add(**{"args": args})
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "already" not in msg and "exist" not in msg:
+                raise
+            LOG.info("Subsystem %s already present, reusing it: %s", nqn, exc)
 
     if subsystem_config is None:
         subsystem_config = nvme_service.config.get("subsystems", [])
@@ -222,9 +228,15 @@ def configure_hosts(gateway, config: dict, ceph_cluster=None, initiators=None):
 
         sub_args = {"subsystem": nqn}
         if sub_cfg.get("allow_host"):
-            gateway.host.add(
-                **{"args": {**sub_args, **{"host": repr(sub_cfg["allow_host"])}}}
-            )
+            try:
+                gateway.host.add(
+                    **{"args": {**sub_args, **{"host": repr(sub_cfg["allow_host"])}}}
+                )
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "already" not in msg and "exist" not in msg:
+                    raise
+                LOG.info("Host already present: %s", exc)
             if sub_cfg["allow_host"] == "*":
                 validate_hosts(gateway, True, nqn)
             else:
@@ -376,12 +388,23 @@ def configure_namespaces(gateway, config, opt_args={}, rbd_obj=None):
                 if rados_namespace:
                     namespace_args.update({"rados-namespace": rados_namespace})
 
+                # BYOK LUKS encryption (9.2+) — all three keys are optional;
+                # absent means plain namespace (zero impact on existing callers).
+                if bdev_cfg.get("encryption-format"):
+                    namespace_args["encryption-format"] = bdev_cfg["encryption-format"]
+                if bdev_cfg.get("encryption-algorithm"):
+                    namespace_args["encryption-algorithm"] = bdev_cfg[
+                        "encryption-algorithm"
+                    ]
+                if bdev_cfg.get("key-id"):
+                    namespace_args["key-id"] = bdev_cfg["key-id"]
+
                 # consider adding option to create pool and image if it doesn't exist
                 # and also ns_create_image is false
                 if bdev_cfg.get("ns_create_image"):
                     namespace_args.update(
                         {
-                            "size": bdev_cfg.get("size", "1G"),
+                            "rbd-image-size": bdev_cfg.get("size", "1G"),
                             "rbd-create-image": bdev_cfg.get("ns_create_image", True),
                         }
                     )
@@ -528,7 +551,13 @@ def configure_listeners(gateways, config: dict, listeners=None):
                         ),
                     }
                 }
-                gateway.listener.add(**listener_config)
+                try:
+                    gateway.listener.add(**listener_config)
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if "already" not in msg and "exist" not in msg:
+                        raise
+                    LOG.info("Listener already present: %s", exc)
                 expected_listeners.append(listener_config["args"])
             validate_listeners(gateway, expected_listeners, nqn)
 
@@ -631,27 +660,39 @@ def teardown(nvme_service, rbd_obj, cleanup_config=None):
     if "initiators" in nvme_service.config.get("cleanup", []):
         disconnect_initiators(nvme_service)
 
-    # Delete the multiple subsystems across multiple gateways
+    # Delete the multiple subsystems across multiple gateways.
+    # Wrapped in try/except so that a "No such subsystem" error (e.g. when the
+    # test failed before the subsystem was ever created) does not abort teardown
+    # and leave the gateway service running — which would block the next test
+    # from deploying its own gateway on the same nodes.
     if "subsystems" in nvme_service.config["cleanup"]:
         config_sub_node = nvme_service.config["subsystems"]
         if not isinstance(config_sub_node, list):
             config_sub_node = [config_sub_node]
         for sub_cfg in config_sub_node:
             gateway = nvme_service.gateways[0]
-            out, err = gateway.subsystem.delete(
-                **{"args": {"subsystem": sub_cfg["nqn"], "force": True}}
-            )
-            if "success" not in out.lower():
-                LOG.warning(
-                    f"Failed to delete subsystem {sub_cfg['nqn']}: {out} with error {err}"
+            try:
+                out, err = gateway.subsystem.delete(
+                    **{"args": {"subsystem": sub_cfg["nqn"], "force": True}}
                 )
-                rc = 1
+                if "success" not in out.lower():
+                    LOG.warning(
+                        f"Failed to delete subsystem {sub_cfg['nqn']}: {out} with error {err}"
+                    )
+                    rc = 1
+            except Exception as exc:
+                LOG.warning(
+                    "Subsystem %s delete raised %s — skipping (subsystem may not exist yet)",
+                    sub_cfg["nqn"],
+                    exc,
+                )
 
-    # Delete gateways
+    # Delete gateways — always attempted even if subsystem cleanup above failed.
     if "gateway" in nvme_service.config.get("cleanup", []):
-        rc = nvme_service.delete_nvme_service()
-        if rc != 0:
+        gw_rc = nvme_service.delete_nvme_service()
+        if gw_rc != 0:
             LOG.warning("Failed to delete NVMe gateways")
+            rc = gw_rc
 
     # Delete the pool
     if "pool" in nvme_service.config["cleanup"]:
