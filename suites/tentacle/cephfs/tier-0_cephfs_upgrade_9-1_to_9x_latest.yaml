@@ -232,7 +232,7 @@ tests:
             name: "Fail MDS while Upgrade is in Progress"
             polarion-id: CEPH-83575628
       desc: Running upgrade, mds Failure and i/o's parallelly
-      abort-on-fail: true
+      abort-on-fail: false
   -
     test:
       abort-on-fail: false
