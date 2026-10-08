@@ -145,6 +145,25 @@ tests:
       name: "Metadata validation for Upgrade"
       polarion-id: CEPH-83575313
 
+  # Dev ask (IBMCEPH-18199 / IBMCEPH-10216): elevate MDS debug before upgrade+failover
+  # so rejoin hangs have peer-messaging detail. Heavy logs — keep on TFA/debug branch.
+  - test:
+      abort-on-fail: true
+      name: "Enable MDS debug logging"
+      desc: "Set debug_mds=20 before upgrade + MDS failover (Dev log requirement)"
+      module: test_cephadm.py
+      config:
+        steps:
+          - config:
+              command: shell
+              args:
+                - ceph
+                - config
+                - set
+                - mds
+                - debug_mds
+                - "20"
+
   - test:
       name: Upgrade along with IOs
       module: test_parallel.py
