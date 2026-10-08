@@ -52,8 +52,8 @@ def run(ceph_cluster, **kw):
        3. Subvol_group_1 → Subvol_3
        4. Subvol_group_2 → Subvol_4
     4. Create multiple ceph clients
-       1. Client 1: with out RootSquash
-       2. Client 2: with roosquash with out any path in cephfs_1
+       1. Client 1: root_squash without fsname (all filesystems)
+       2. Client 2: root_squash with explicit fsname on cephfs_1 and cephfs_2
        3. Client 3: with rootsquash with a particluar path in cephfs_1
        4. Client 4: With rootsquash with particular path in both filesystems(Cephfs_1, Cephfs_2)
     5. Mount using kernel and fuse with above clients on 2 Virtual Machines
@@ -128,7 +128,12 @@ def run(ceph_cluster, **kw):
             client,
             "client_2",
             mon_caps="allow *",
-            mds_caps=f"allow * fsname={fs_list[0]} root_squash",
+            # Explicit fsname + root_squash on both FS so Test 3 can mount each
+            # filesystem; without cephfs_2 caps, fuse/kernel mount returns EPERM.
+            mds_caps=(
+                f"allow * fsname={fs_list[0]} root_squash, "
+                f"allow * fsname={fs_list[1]} root_squash"
+            ),
             osd_caps="allow *",
         )
         fs_util.create_ceph_client(
@@ -322,8 +327,8 @@ def run(ceph_cluster, **kw):
                 )
 
             log.info(
-                "Test 3: Client should not be able to create or delete folders in any path "
-                "in any filesystem even if specific Fs is provided"
+                "Test 3: Client with root_squash and explicit fsname caps should not be "
+                "able to create or delete folders on either mounted filesystem"
             )
             fs_util.fuse_mount(
                 [client],
@@ -364,9 +369,6 @@ def run(ceph_cluster, **kw):
                     file_name="test_scenario_3_1",
                     allowed=False,
                 )
-            log.info(
-                "NOTE: *******Change the allowed flag based on BZ : 2293943********"
-            )
 
             log.info(
                 "Test 4: Create a client with 2 file system with 1 enabling root_squash and other without root_squash"
