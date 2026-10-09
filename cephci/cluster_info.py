@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 import re
+import time
 
 import yaml
 from docopt import docopt
@@ -23,6 +24,57 @@ log = Log(__name__)
 CEPH_VAR_LOG_DIR = "/var/log/ceph"
 _CEPH_VAR_LOG_DIR = "var/log/ceph"
 CEPH_COREDUMP_DIR = "/var/lib/systemd/coredump/"
+# Retries per node for tar/download (transient SSH, mid-write tar, etc.)
+_COLLECT_RETRIES = 3
+_COLLECT_RETRY_DELAY_SEC = 30
+
+
+def _tar_and_download(node, tar_cmd, tar_file, download_dir, label):
+    """
+    Run tar on a node, accept exit 0/1 when archive exists, download to download_dir.
+
+    Retries the full tar+download sequence on any failure. Returns True on success.
+    """
+    for attempt in range(1, _COLLECT_RETRIES + 1):
+        try:
+            node.exec_command(cmd=tar_cmd, sudo=True, check_ec=False)
+            tar_ec = getattr(node, "exit_status", None)
+            # 0 = ok; 1 = files changed while reading (archive usually still valid)
+            if tar_ec not in (0, 1):
+                raise RuntimeError(f"tar exited {tar_ec}")
+
+            node.exec_command(cmd=f"test -f {tar_file}", sudo=True, check_ec=False)
+            if getattr(node, "exit_status", 1) != 0:
+                raise RuntimeError(f"archive {tar_file} missing after tar (exit {tar_ec})")
+
+            if tar_ec == 1:
+                log.warning(
+                    f"tar exited 1 on {node.hostname} (files changed while "
+                    f"archiving); downloading {tar_file} anyway"
+                )
+
+            node.download_file(
+                src=tar_file,
+                dst=os.path.join(download_dir, tar_file),
+                sudo=True,
+            )
+            log.info(
+                f"Downloaded {label} {tar_file} from {node.hostname} to {download_dir}"
+            )
+            return True
+        except Exception as e:
+            log.error(
+                f"Failed to collect {label} from {node.hostname} "
+                f"(attempt {attempt}/{_COLLECT_RETRIES}): {e}"
+            )
+            if attempt < _COLLECT_RETRIES:
+                time.sleep(_COLLECT_RETRY_DELAY_SEC)
+    log.error(
+        f"Giving up collecting {label} from {node.hostname} after "
+        f"{_COLLECT_RETRIES} attempts"
+    )
+    return False
+
 
 doc = """
 Utility to gather cluster information
@@ -166,41 +218,34 @@ def get_ceph_var_logs(cluster, log_dir):
     """
     This method is to download and store
     ceph cluster var logs into log directory.
+
+    GNU tar exits 1 when files change while being read (common for live
+    MDS/mgr logs under elevated debug). Treat 0/1 as success when the
+    archive exists, retry per node on any failure, and continue to other nodes.
     """
     download_dir = os.path.join(log_dir, "ceph_logs")
     os.makedirs(download_dir, exist_ok=True)
     for node in cluster.get_nodes():
         tar_file = f"{node.hostname}-cephlog.tar"
-        node.exec_command(
-            cmd=f"tar -C / --warning=no-file-changed -cvzf {tar_file} {_CEPH_VAR_LOG_DIR}",
-            sudo=True,
+        tar_cmd = (
+            f"tar -C / --warning=no-file-changed -cvzf {tar_file} {_CEPH_VAR_LOG_DIR}"
         )
-
-        node.download_file(
-            src=tar_file,
-            dst=os.path.join(download_dir, tar_file),
-            sudo=True,
-        )
-        log.info(f"Downloading {tar_file} from {node.hostname} to {download_dir}")
+        _tar_and_download(node, tar_cmd, tar_file, download_dir, label="ceph logs")
 
 
 def collect_ceph_coredumps(cluster, _dir):
     """
     This method is to download and store
     ceph coredumps into custom directory.
+
+    Retry per node on failure; one host does not abort the rest.
     """
     download_dir = os.path.join(_dir, "ceph_coredumps")
     os.makedirs(download_dir, exist_ok=True)
     for node in cluster.get_nodes():
         tar_file = f"{node.hostname}-coredump.tar"
-        node.exec_command(cmd=f"tar -cvzf {tar_file} {CEPH_COREDUMP_DIR}", sudo=True)
-
-        node.download_file(
-            src=tar_file,
-            dst=os.path.join(download_dir, tar_file),
-            sudo=True,
-        )
-        log.info(f"Downloading {tar_file} from {node.hostname} to {download_dir}")
+        tar_cmd = f"tar -cvzf {tar_file} {CEPH_COREDUMP_DIR}"
+        _tar_and_download(node, tar_cmd, tar_file, download_dir, label="coredumps")
 
 
 def write_output(data, output):

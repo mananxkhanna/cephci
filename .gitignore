@@ -27,3 +27,4 @@ rerun
 sut.yaml
 
 **/.coverage
+TRACKER_mds_rejoin_upgrade.md
