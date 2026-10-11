@@ -18,8 +18,9 @@ What this module does (phases)
 2. ``client.admin`` (when ``rotate_admin``):
    - ``cephadm shell -- ceph auth get-or-create client.admin-backup``
    - ``cephadm shell -- ceph auth rotate client.admin --key-type <key_type>``
-   - ``cephadm shell -- ceph auth get client.admin`` → rewrite
-     ``/etc/ceph/ceph.client.admin.keyring`` on installer + all client nodes
+   - post-rotate ``ceph auth get client.admin`` via ``cephadm shell --name mon.*``
+     (host ``/etc/ceph`` admin keyring is stale until rewrite)
+   - rewrite ``/etc/ceph/ceph.client.admin.keyring`` on installer + all clients
    - verify key changed; ``ceph auth rm client.admin-backup``
 
 3. Mount clients (kernel/fuse recipes from JSON or mirror pickle):
@@ -127,12 +128,19 @@ class CephfsMountRecipe:
     kernel_extra_params: str = ""
 
 
+def _cmd_detail(out, err) -> str:
+    """Merge stdout/stderr for failure messages (either stream may hold the error)."""
+    parts = [p for p in ((out or "").strip(), (err or "").strip()) if p]
+    return " | ".join(parts) if parts else "(no output)"
+
+
 def _cephadm_shell(installer, subcmd: str) -> str:
     """
     Run ``cephadm shell -- <subcmd>`` on the installer.
 
-    Used for auth rotate/get so commands hit the mon with cluster identity
-    even when host ``/etc/ceph`` keyrings are stale mid-rotate.
+    Uses the mounted host ``/etc/ceph`` admin keyring. After ``client.admin``
+    rotate and before that keyring is rewritten, use
+    ``_cephadm_shell_as_mon`` instead.
     """
     out, err = installer.exec_command(
         sudo=True,
@@ -142,7 +150,54 @@ def _cephadm_shell(installer, subcmd: str) -> str:
     if installer.exit_status != 0:
         raise OperationFailedError(
             f"cephadm shell failed (rc={installer.exit_status}): "
-            f"{(out or err or '').strip()}"
+            f"{_cmd_detail(out, err)}"
+        )
+    return (out or err or "").strip()
+
+
+def _local_mon_daemon_name(installer) -> str:
+    """Return a local ``mon.*`` daemon name from ``cephadm ls`` on the installer."""
+    out, err = installer.exec_command(
+        sudo=True,
+        cmd="cephadm ls --format json",
+        check_ec=False,
+    )
+    if installer.exit_status != 0:
+        raise OperationFailedError(
+            f"cephadm ls failed (rc={installer.exit_status}): "
+            f"{_cmd_detail(out, err)}"
+        )
+    try:
+        daemons = json.loads(out or "[]")
+    except json.JSONDecodeError as exc:
+        raise OperationFailedError(f"cephadm ls JSON parse failed: {exc}") from exc
+    for daemon in daemons:
+        name = daemon.get("name") or ""
+        if name.startswith("mon."):
+            return name
+    raise OperationFailedError(
+        "No local mon.* daemon on installer; needed to auth after "
+        "client.admin rotate while /etc/ceph admin keyring is stale"
+    )
+
+
+def _cephadm_shell_as_mon(installer, subcmd: str) -> str:
+    """
+    Run ``cephadm shell --name mon.* -- <subcmd>``.
+
+    Mon daemon identity is unaffected by ``client.admin`` rotate, so this
+    works while host ``/etc/ceph/ceph.client.admin.keyring`` is still stale.
+    """
+    mon_name = _local_mon_daemon_name(installer)
+    out, err = installer.exec_command(
+        sudo=True,
+        cmd=f"cephadm shell --name {mon_name} -- {subcmd}",
+        check_ec=False,
+    )
+    if installer.exit_status != 0:
+        raise OperationFailedError(
+            f"cephadm shell --name {mon_name} failed "
+            f"(rc={installer.exit_status}): {_cmd_detail(out, err)}"
         )
     return (out or err or "").strip()
 
@@ -215,11 +270,10 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
     Steps:
       1. Snapshot key (masked log); create ``client.admin-backup``.
       2. ``ceph auth rotate client.admin --key-type <key_type>`` via cephadm.
-      3. Fail if key unchanged.
-      4. ``ceph auth get client.admin`` via cephadm → write
-         ``/etc/ceph/ceph.client.admin.keyring`` on each key_node
-         (host CLI is stale until this rewrite).
-      5. Verify get; remove backup entity.
+      3. ``ceph auth get client.admin`` via local mon identity (admin keyring
+         on the host is stale until step 4).
+      4. Fail if key unchanged; write new keyring on each key_node.
+      5. Verify get with default cephadm shell; remove backup entity.
     """
     log.info("=== rotate client.admin (with backup entity) ===")
     before = _get_entity_key(installer, "client.admin")
@@ -234,12 +288,18 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
         installer, f"ceph auth rotate client.admin --key-type {key_type}"
     )
 
-    after = _get_entity_key(installer, "client.admin")
+    # Default cephadm shell mounts stale /etc/ceph admin keyring → EACCES.
+    keyring_blob = _cephadm_shell_as_mon(installer, "ceph auth get client.admin")
+    match = KEYRING_PATTERN.search(keyring_blob)
+    if not match:
+        raise OperationFailedError(
+            "Could not parse client.admin key after rotate (mon-identity get)"
+        )
+    after = match.group(1)
     if before == after:
         raise OperationFailedError("client.admin key unchanged after auth rotate")
     log.info("client.admin rotated key %s", _mask_key(after))
 
-    keyring_blob = _cephadm_shell(installer, "ceph auth get client.admin")
     for node in key_nodes:
         log.info("Refreshing %s on %s", ADMIN_KEYRING_PATH, node.hostname)
         _write_remote_text(node, ADMIN_KEYRING_PATH, keyring_blob, mode="644")
