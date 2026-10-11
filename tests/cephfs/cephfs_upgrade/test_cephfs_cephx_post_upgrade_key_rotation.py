@@ -294,11 +294,10 @@ def _collect_cephfs_mount_recipes(config: dict) -> List[CephfsMountRecipe]:
                 elif "cephfs_kernel" in mnt_pt:
                     kind = "kernel"
                 else:
-                    log.warning(
-                        "Skipping unrecognized mount path %s (not kernel/fuse)",
-                        mnt_pt,
+                    raise OperationFailedError(
+                        f"Unrecognized CephFS mount path {mnt_pt!r}; "
+                        "expected cephfs_kernel or cephfs_fuse in mnt_pt"
                     )
-                    continue
                 recipes.append(
                     CephfsMountRecipe(
                         mnt_pt=mnt_pt,
