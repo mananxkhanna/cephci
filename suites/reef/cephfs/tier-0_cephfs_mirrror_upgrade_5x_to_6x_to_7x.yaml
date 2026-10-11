@@ -258,6 +258,22 @@ tests:
       desc: Running upgrade, mds Failure and i/o's parallelly
       abort-on-fail: false
 
+  # CephX post-upgrade on ceph1 only after hop 2:
+  #   1) dnf update client RPMs on ceph1 clients
+  #   2) rotate client.admin (aes256k), rewrite admin keyring on installer+clients
+  #   3) rotate mount client; umount/remount kernel+fuse from variables.pkl (FS-root);
+  #      printf/cat probe at the same pickle paths for later post_upgrade_validate
+  - test:
+      name: CephFS CephX key rotation post-upgrade
+      module: cephfs_upgrade.test_cephfs_cephx_post_upgrade_key_rotation.py
+      desc: "ceph1 after hop 2: client RPM update; rotate client.admin + mount clients; FS-root remount from pickle with probe."
+      polarion-id: CEPH-xxxxx
+      abort-on-fail: true
+      clusters:
+        ceph1:
+          config:
+            mirror_pickle: true
+
   - test:
       abort-on-fail: false
       desc: Validate the Synchronisation is successful upon upgrade of second cluster
