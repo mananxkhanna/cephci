@@ -18,10 +18,10 @@ What this module does (phases)
 2. ``client.admin`` (when ``rotate_admin``):
    - ``cephadm shell -- ceph auth get-or-create client.admin-backup``
    - ``cephadm shell -- ceph auth rotate client.admin --key-type <key_type>``
-   - prefer keyring from rotate stdout; else ``ceph auth get`` via
-     ``cephadm shell --name mon.*`` (host ``/etc/ceph`` keyring is stale)
+   - prefer clean ``[client.admin]`` block from rotate stdout; else
+     ``ceph auth get`` via ``cephadm shell --name mon.*`` (host keyring stale)
    - rewrite ``/etc/ceph/ceph.client.admin.keyring`` on installer + all clients
-   - verify key changed; ``ceph auth rm client.admin-backup``
+   - verify with default ``cephadm shell``; ``auth rm`` backup via mon identity
 
 3. Mount clients (kernel/fuse recipes from JSON or mirror pickle):
    For each distinct ``client.<hostname>``:
@@ -132,6 +132,32 @@ def _cmd_detail(out, err) -> str:
     """Merge stdout/stderr for failure messages (either stream may hold the error)."""
     parts = [p for p in ((out or "").strip(), (err or "").strip()) if p]
     return " | ".join(parts) if parts else "(no output)"
+
+
+def _extract_client_admin_keyring(text: str) -> Optional[str]:
+    """
+    Return a clean ``[client.admin]`` keyring block from command output.
+
+    ``cephadm shell`` / ``auth rotate`` often prefix noise (e.g. ``Inferring
+    fsid ...``). Writing that noise into ``/etc/ceph`` breaks later default
+    ``cephadm shell`` auth (rc=13).
+    """
+    if not text:
+        return None
+    marker = "[client.admin]"
+    idx = text.find(marker)
+    if idx < 0:
+        return None
+    lines = text[idx:].splitlines()
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if line.startswith("[") and not line.startswith(marker):
+            break
+        kept.append(line)
+    blob = "\n".join(kept).strip()
+    if not KEYRING_PATTERN.search(blob):
+        return None
+    return blob
 
 
 def _cephadm_shell(installer, subcmd: str) -> str:
@@ -272,10 +298,11 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
     Steps:
       1. Snapshot key (masked log); create ``client.admin-backup``.
       2. ``ceph auth rotate client.admin --key-type <key_type>`` via cephadm.
-      3. Prefer keyring blob from rotate stdout; if missing, ``ceph auth get``
-         via local mon identity (host admin keyring is stale until step 4).
+      3. Prefer a clean ``[client.admin]`` block from rotate stdout; else
+         ``ceph auth get`` via mon identity (host keyring stale until step 4).
       4. Fail if key unchanged; write new keyring on each key_node.
-      5. Verify get with default cephadm shell; remove backup entity.
+      5. Verify get with default cephadm shell (proves host rewrite worked);
+         ``auth rm`` backup via mon identity.
     """
     log.info("=== rotate client.admin (with backup entity) ===")
     # Use mon identity for baseline read: the host-side admin keyring may already
@@ -298,26 +325,29 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
         installer, f"ceph auth rotate client.admin --key-type {key_type}"
     )
 
-    # Rotate usually prints the new keyring; prefer that over a post-rotate get
-    # (default cephadm shell mounts the stale host keyring → EACCES until rewrite).
-    match = KEYRING_PATTERN.search(rotate_out or "")
-    if match:
-        keyring_blob = rotate_out
-        log.info("Using client.admin keyring from auth rotate stdout")
+    # Prefer a cleaned rotate keyring for rewrite; never write shell noise
+    # (e.g. "Inferring fsid ...") into /etc/ceph — that yields rc=13 later.
+    keyring_blob = _extract_client_admin_keyring(rotate_out or "")
+    if keyring_blob:
+        log.info("Using cleaned client.admin keyring from auth rotate stdout")
+        match = KEYRING_PATTERN.search(keyring_blob)
     else:
         log.info(
-            "auth rotate stdout had no parseable key; "
-            "fetching client.admin via mon identity"
+            "auth rotate stdout had no clean [client.admin] block; "
+            "fetching client.admin via mon identity for rewrite"
         )
         keyring_blob = _cephadm_shell_as_mon(
             installer, "ceph auth get client.admin"
         )
-        match = KEYRING_PATTERN.search(keyring_blob)
-        if not match:
-            raise OperationFailedError(
-                "Could not parse client.admin key after rotate "
-                "(rotate stdout and mon-identity get)"
-            )
+        keyring_blob = (
+            _extract_client_admin_keyring(keyring_blob) or keyring_blob
+        )
+        match = KEYRING_PATTERN.search(keyring_blob or "")
+    if not match:
+        raise OperationFailedError(
+            "Could not parse client.admin key after rotate "
+            "(rotate stdout and mon-identity get)"
+        )
     after = match.group(1)
     if before == after:
         raise OperationFailedError("client.admin key unchanged after auth rotate")
@@ -327,8 +357,10 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
         log.info("Refreshing %s on %s", ADMIN_KEYRING_PATH, node.hostname)
         _write_remote_text(node, ADMIN_KEYRING_PATH, keyring_blob, mode="644")
 
+    # Default shell must work after host rewrite (proves keyring file is good).
     _cephadm_shell(installer, "ceph auth get client.admin")
-    _cephadm_shell(installer, f"ceph auth rm {ADMIN_BACKUP_ENTITY}")
+    # Backup rm via mon: does not depend on host admin keyring.
+    _cephadm_shell_as_mon(installer, f"ceph auth rm {ADMIN_BACKUP_ENTITY}")
     log.info("client.admin rotated and keyring refreshed on admin nodes")
 
 
