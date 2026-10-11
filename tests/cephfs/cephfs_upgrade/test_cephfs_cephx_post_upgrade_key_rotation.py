@@ -18,8 +18,8 @@ What this module does (phases)
 2. ``client.admin`` (when ``rotate_admin``):
    - ``cephadm shell -- ceph auth get-or-create client.admin-backup``
    - ``cephadm shell -- ceph auth rotate client.admin --key-type <key_type>``
-   - post-rotate ``ceph auth get client.admin`` via ``cephadm shell --name mon.*``
-     (host ``/etc/ceph`` admin keyring is stale until rewrite)
+   - prefer keyring from rotate stdout; else ``ceph auth get`` via
+     ``cephadm shell --name mon.*`` (host ``/etc/ceph`` keyring is stale)
    - rewrite ``/etc/ceph/ceph.client.admin.keyring`` on installer + all clients
    - verify key changed; ``ceph auth rm client.admin-backup``
 
@@ -159,7 +159,9 @@ def _local_mon_daemon_name(installer) -> str:
     """Return a local ``mon.*`` daemon name from ``cephadm ls`` on the installer."""
     out, err = installer.exec_command(
         sudo=True,
-        cmd="cephadm ls --format json",
+        # Plain `cephadm ls` already emits JSON; `--format json` is rejected as an
+        # unrecognized global arg on some host cephadm builds.
+        cmd="cephadm ls",
         check_ec=False,
     )
     if installer.exit_status != 0:
@@ -270,13 +272,21 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
     Steps:
       1. Snapshot key (masked log); create ``client.admin-backup``.
       2. ``ceph auth rotate client.admin --key-type <key_type>`` via cephadm.
-      3. ``ceph auth get client.admin`` via local mon identity (admin keyring
-         on the host is stale until step 4).
+      3. Prefer keyring blob from rotate stdout; if missing, ``ceph auth get``
+         via local mon identity (host admin keyring is stale until step 4).
       4. Fail if key unchanged; write new keyring on each key_node.
       5. Verify get with default cephadm shell; remove backup entity.
     """
     log.info("=== rotate client.admin (with backup entity) ===")
-    before = _get_entity_key(installer, "client.admin")
+    # Use mon identity for baseline read: the host-side admin keyring may already
+    # be stale (e.g. after a prior upgrade hop) and cephadm shell would get rc=13.
+    raw_before = _cephadm_shell_as_mon(installer, "ceph auth get client.admin")
+    match_before = KEYRING_PATTERN.search(raw_before)
+    if not match_before:
+        raise OperationFailedError(
+            "Could not parse client.admin key before rotate (mon-identity get)"
+        )
+    before = match_before.group(1)
     log.info("client.admin baseline key %s", _mask_key(before))
 
     _cephadm_shell(
@@ -284,17 +294,30 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
         f'ceph auth get-or-create {ADMIN_BACKUP_ENTITY} mon "allow *"',
     )
     _cephadm_shell(installer, f"ceph auth get {ADMIN_BACKUP_ENTITY}")
-    _cephadm_shell(
+    rotate_out = _cephadm_shell(
         installer, f"ceph auth rotate client.admin --key-type {key_type}"
     )
 
-    # Default cephadm shell mounts stale /etc/ceph admin keyring → EACCES.
-    keyring_blob = _cephadm_shell_as_mon(installer, "ceph auth get client.admin")
-    match = KEYRING_PATTERN.search(keyring_blob)
-    if not match:
-        raise OperationFailedError(
-            "Could not parse client.admin key after rotate (mon-identity get)"
+    # Rotate usually prints the new keyring; prefer that over a post-rotate get
+    # (default cephadm shell mounts the stale host keyring → EACCES until rewrite).
+    match = KEYRING_PATTERN.search(rotate_out or "")
+    if match:
+        keyring_blob = rotate_out
+        log.info("Using client.admin keyring from auth rotate stdout")
+    else:
+        log.info(
+            "auth rotate stdout had no parseable key; "
+            "fetching client.admin via mon identity"
         )
+        keyring_blob = _cephadm_shell_as_mon(
+            installer, "ceph auth get client.admin"
+        )
+        match = KEYRING_PATTERN.search(keyring_blob)
+        if not match:
+            raise OperationFailedError(
+                "Could not parse client.admin key after rotate "
+                "(rotate stdout and mon-identity get)"
+            )
     after = match.group(1)
     if before == after:
         raise OperationFailedError("client.admin key unchanged after auth rotate")
@@ -511,9 +534,18 @@ def _umount_cephfs_only(client, mnt_pt: str, nfs_paths: Set[str]) -> None:
     if fstype in ("nfs", "nfs4"):
         log.info("Skipping umount of NFS fstype at %s", mnt_pt)
         return
-    client.exec_command(sudo=True, cmd=f"umount {mnt_pt}", check_ec=False)
+    client.exec_command(
+        sudo=True, cmd=f"umount {mnt_pt}", timeout=120, check_ec=False
+    )
     if client.exit_status != 0:
-        client.exec_command(sudo=True, cmd=f"umount -l {mnt_pt}", check_ec=False)
+        log.info(
+            "Doing lazy umount (-l) for %s (plain umount rc=%s)",
+            mnt_pt,
+            client.exit_status,
+        )
+        client.exec_command(
+            sudo=True, cmd=f"umount -l {mnt_pt}", timeout=120, check_ec=False
+        )
 
 
 def _remount_recipe(fs_util: FsUtils, client, recipe: CephfsMountRecipe) -> None:
@@ -726,6 +758,7 @@ def run(ceph_cluster, **kw):
             opts.install_client_rpms,
         )
 
+        admin_refreshed = False
         if opts.install_client_rpms:
             _install_client_rpms(clients, opts.client_packages)
         if opts.rotate_admin:
@@ -734,6 +767,7 @@ def run(ceph_cluster, **kw):
                 _admin_keyring_nodes(ceph_cluster, clients),
                 opts.key_type,
             )
+            admin_refreshed = True
 
         pre_upgrade_config = None
         nfs_paths: Set[str] = set()
@@ -790,7 +824,12 @@ def run(ceph_cluster, **kw):
         else:
             log.info("rotate_nfs=false; NFS rotate-key phase not enabled")
 
-        log.info("Post-upgrade CephX key rotation completed successfully")
+        log.info(
+            "TEST PASSED - Post-upgrade CephX key rotation verified for %d "
+            "mount(s)%s",
+            len(recipes),
+            ", admin keyring refreshed" if admin_refreshed else "",
+        )
         return 0
     except Exception as exc:
         log.error("Post-upgrade CephX key rotation failed: %s", exc)
