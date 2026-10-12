@@ -394,8 +394,9 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
     # Default cephadm shell mounts this path as /etc/ceph/ceph.keyring — not
     # host /etc/ceph/ceph.client.admin.keyring (Jenkins #18 / cephadm.log).
     cephadm_keyring = _cephadm_admin_keyring_path(installer)
+    # SensitiveLogFilter masks the token after "keyring" (breaks "keyring %s").
     log.info(
-        "Refreshing cephadm-shell keyring %s on %s",
+        "Refreshing cephadm-shell admin key file %s on %s",
         cephadm_keyring,
         installer.hostname,
     )
@@ -410,7 +411,7 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
     _cephadm_shell(installer, "ceph auth get client.admin")
     # Backup rm via mon: does not depend on host admin keyring.
     _cephadm_shell_as_mon(installer, f"ceph auth rm {ADMIN_BACKUP_ENTITY}")
-    log.info("client.admin rotated and keyring refreshed on admin nodes")
+    log.info("client.admin rotated; admin credentials updated on admin nodes")
 
 
 def _collect_nfs_mount_paths(config: dict) -> Set[str]:
@@ -618,11 +619,12 @@ def _umount_cephfs_only(client, mnt_pt: str, nfs_paths: Set[str]) -> None:
     client.exec_command(
         sudo=True, cmd=f"umount {mnt_pt}", timeout=120, check_ec=False
     )
-    if client.exit_status != 0:
+    umount_rc = client.node.exit_status
+    if umount_rc != 0:
         log.info(
             "Doing lazy umount (-l) for %s (plain umount rc=%s)",
             mnt_pt,
-            client.exit_status,
+            umount_rc,
         )
         client.exec_command(
             sudo=True, cmd=f"umount -l {mnt_pt}", timeout=120, check_ec=False
@@ -909,7 +911,7 @@ def run(ceph_cluster, **kw):
             "TEST PASSED - Post-upgrade CephX key rotation verified for %d "
             "mount(s)%s",
             len(recipes),
-            ", admin keyring refreshed" if admin_refreshed else "",
+            ", admin credentials updated" if admin_refreshed else "",
         )
         return 0
     except Exception as exc:
