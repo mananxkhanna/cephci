@@ -21,6 +21,8 @@ What this module does (phases)
    - prefer clean ``[client.admin]`` block from rotate stdout; else
      ``ceph auth get`` via ``cephadm shell --name mon.*`` (host keyring stale)
    - rewrite ``/etc/ceph/ceph.client.admin.keyring`` on installer + all clients
+   - also rewrite ``/var/lib/ceph/<fsid>/config/ceph.client.admin.keyring``
+     on the installer (path ``cephadm shell`` bind-mounts as ``/etc/ceph/ceph.keyring``)
    - verify with default ``cephadm shell``; ``auth rm`` backup via mon identity
 
 3. Mount clients (kernel/fuse recipes from JSON or mirror pickle):
@@ -67,6 +69,10 @@ DEFAULT_CLIENT_RPM_PACKAGES = (
 DEFAULT_UPGRADE_CONFIG_PATH = "/home/cephuser/cephfs_upgrade_config.json"
 ADMIN_BACKUP_ENTITY = "client.admin-backup"
 ADMIN_KEYRING_PATH = "/etc/ceph/ceph.client.admin.keyring"
+# cephadm shell bind-mounts this host path as /etc/ceph/ceph.keyring (IBM #18).
+CEPHADM_ADMIN_KEYRING_TMPL = (
+    "/var/lib/ceph/{fsid}/config/ceph.client.admin.keyring"
+)
 KEYRING_PATTERN = re.compile(r"^\s*key\s*=\s*(\S+)\s*$", re.MULTILINE)
 PROBE_BASENAME = "cephx_post_upgrade_probe"
 PROBE_CONTENT = "cephx-post-upgrade-probe"
@@ -164,8 +170,11 @@ def _cephadm_shell(installer, subcmd: str) -> str:
     """
     Run ``cephadm shell -- <subcmd>`` on the installer.
 
-    Uses the mounted host ``/etc/ceph`` admin keyring. After ``client.admin``
-    rotate and before that keyring is rewritten, use
+    Auth uses the keyring cephadm bind-mounts from
+    ``/var/lib/ceph/<fsid>/config/ceph.client.admin.keyring`` (as
+    ``/etc/ceph/ceph.keyring`` inside the container), not necessarily
+    host ``/etc/ceph/ceph.client.admin.keyring``. After ``client.admin``
+    rotate and before that cephadm config keyring is rewritten, use
     ``_cephadm_shell_as_mon`` instead.
     """
     out, err = installer.exec_command(
@@ -181,8 +190,8 @@ def _cephadm_shell(installer, subcmd: str) -> str:
     return (out or err or "").strip()
 
 
-def _local_mon_daemon_name(installer) -> str:
-    """Return a local ``mon.*`` daemon name from ``cephadm ls`` on the installer."""
+def _cephadm_ls_daemons(installer) -> list:
+    """Return parsed ``cephadm ls`` JSON list from the installer."""
     out, err = installer.exec_command(
         sudo=True,
         # Plain `cephadm ls` already emits JSON; `--format json` is rejected as an
@@ -199,7 +208,30 @@ def _local_mon_daemon_name(installer) -> str:
         daemons = json.loads(out or "[]")
     except json.JSONDecodeError as exc:
         raise OperationFailedError(f"cephadm ls JSON parse failed: {exc}") from exc
-    for daemon in daemons:
+    if not isinstance(daemons, list):
+        raise OperationFailedError("cephadm ls did not return a JSON list")
+    return daemons
+
+
+def _cluster_fsid(installer) -> str:
+    """Return cluster fsid from ``cephadm ls`` on the installer."""
+    for daemon in _cephadm_ls_daemons(installer):
+        fsid = daemon.get("fsid") or ""
+        if fsid:
+            return fsid
+    raise OperationFailedError(
+        "No fsid in cephadm ls; needed to refresh cephadm admin keyring path"
+    )
+
+
+def _cephadm_admin_keyring_path(installer) -> str:
+    """Host path cephadm shell bind-mounts as the admin keyring."""
+    return CEPHADM_ADMIN_KEYRING_TMPL.format(fsid=_cluster_fsid(installer))
+
+
+def _local_mon_daemon_name(installer) -> str:
+    """Return a local ``mon.*`` daemon name from ``cephadm ls`` on the installer."""
+    for daemon in _cephadm_ls_daemons(installer):
         name = daemon.get("name") or ""
         if name.startswith("mon."):
             return name
@@ -300,8 +332,10 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
       2. ``ceph auth rotate client.admin --key-type <key_type>`` via cephadm.
       3. Prefer a clean ``[client.admin]`` block from rotate stdout; else
          ``ceph auth get`` via mon identity (host keyring stale until step 4).
-      4. Fail if key unchanged; write new keyring on each key_node.
-      5. Verify get with default cephadm shell (proves host rewrite worked);
+      4. Fail if key unchanged; write new keyring on each key_node
+         (``/etc/ceph/...``) and on the installer's cephadm config path
+         (``/var/lib/ceph/<fsid>/config/...`` — what default shell mounts).
+      5. Verify get with default cephadm shell (proves cephadm keyring rewrite);
          ``auth rm`` backup via mon identity.
     """
     log.info("=== rotate client.admin (with backup entity) ===")
@@ -326,7 +360,7 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
     )
 
     # Prefer a cleaned rotate keyring for rewrite; never write shell noise
-    # (e.g. "Inferring fsid ...") into /etc/ceph — that yields rc=13 later.
+    # (e.g. "Inferring fsid ...") into keyring files — that yields rc=13 later.
     keyring_blob = _extract_client_admin_keyring(rotate_out or "")
     if keyring_blob:
         log.info("Using cleaned client.admin keyring from auth rotate stdout")
@@ -357,7 +391,22 @@ def _rotate_client_admin(installer, key_nodes, key_type: str) -> None:
         log.info("Refreshing %s on %s", ADMIN_KEYRING_PATH, node.hostname)
         _write_remote_text(node, ADMIN_KEYRING_PATH, keyring_blob, mode="644")
 
-    # Default shell must work after host rewrite (proves keyring file is good).
+    # Default cephadm shell mounts this path as /etc/ceph/ceph.keyring — not
+    # host /etc/ceph/ceph.client.admin.keyring (Jenkins #18 / cephadm.log).
+    cephadm_keyring = _cephadm_admin_keyring_path(installer)
+    log.info(
+        "Refreshing cephadm-shell keyring %s on %s",
+        cephadm_keyring,
+        installer.hostname,
+    )
+    installer.exec_command(
+        sudo=True,
+        cmd=f"mkdir -p {os.path.dirname(cephadm_keyring)}",
+        check_ec=False,
+    )
+    _write_remote_text(installer, cephadm_keyring, keyring_blob, mode="600")
+
+    # Default shell must work after cephadm config keyring rewrite.
     _cephadm_shell(installer, "ceph auth get client.admin")
     # Backup rm via mon: does not depend on host admin keyring.
     _cephadm_shell_as_mon(installer, f"ceph auth rm {ADMIN_BACKUP_ENTITY}")
