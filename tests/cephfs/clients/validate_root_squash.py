@@ -164,16 +164,26 @@ def run(ceph_cluster, **kw):
             client,
             "client_5",
             mon_caps="allow *",
-            mds_caps=f"allow * fsname={fs_list[0]} root_squash,allow * path=/volumes/subvol_group_1/subvol_3,"
-            f"allow rw fsname={fs_list[1]} root_squash,allow * path=/volumes/subvol_group_2/subvol_4",
+            # Path clauses need fsname= so multi-FS kernels (RHEL 10+) match the
+            # unsquashed subvol allow against the mounted FS; bare path= is ignored.
+            mds_caps=(
+                f"allow * fsname={fs_list[0]} root_squash, "
+                f"allow * fsname={fs_list[0]} path=/volumes/subvol_group_1/subvol_3, "
+                f"allow rw fsname={fs_list[1]} root_squash, "
+                f"allow * fsname={fs_list[1]} path=/volumes/subvol_group_2/subvol_4"
+            ),
             osd_caps="allow *",
         )
         fs_util.create_ceph_client(
             client,
             "client_7",
             mon_caps="allow *",
-            mds_caps=f"allow * fsname={fs_list[0]} root_squash,allow * path=/volumes/subvol_group_1/subvol_3,"
-            f"allow rw fsname={fs_list[1]} root_squash,allow * path=/volumes/subvol_group_2/subvol_4",
+            mds_caps=(
+                f"allow * fsname={fs_list[0]} root_squash, "
+                f"allow * fsname={fs_list[0]} path=/volumes/subvol_group_1/subvol_3, "
+                f"allow rw fsname={fs_list[1]} root_squash, "
+                f"allow * fsname={fs_list[1]} path=/volumes/subvol_group_2/subvol_4"
+            ),
             osd_caps="allow *",
         )
         fuse_mount_dir = "/mnt/fuse_" + "".join(
@@ -225,7 +235,10 @@ def run(ceph_cluster, **kw):
                 client,
                 "client_6",
                 mon_caps="allow *",
-                mds_caps=f"allow * fsname={fs_list[0]} root_squash,allow * path=/not_defined",
+                mds_caps=(
+                    f"allow * fsname={fs_list[0]} root_squash, "
+                    f"allow * fsname={fs_list[0]} path=/not_defined"
+                ),
                 osd_caps="allow *",
             )
             mon_node_ips = fs_util.get_mon_node_ips()
@@ -477,8 +490,12 @@ def run(ceph_cluster, **kw):
                 client,
                 "client_5",
                 mon_caps="allow *",
-                mds_caps=f"allow * fsname={fs_list[0]} root_squash,allow * path=/,"
-                f"allow rw fsname={fs_list[1]} root_squash,allow * path=/",
+                mds_caps=(
+                    f"allow * fsname={fs_list[0]} root_squash, "
+                    f"allow * fsname={fs_list[0]} path=/, "
+                    f"allow rw fsname={fs_list[1]} root_squash, "
+                    f"allow * fsname={fs_list[1]} path=/"
+                ),
                 osd_caps="allow *",
             )
             for cl in [client, client1]:
