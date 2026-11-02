@@ -1,0 +1,283 @@
+#===============================================================================================
+# Tier-level: 0 (must-pass gate)
+# Test-Suite: tier-0_cephfs_must_pass.yaml
+# Conf file : conf/quincy/cephfs/tier-2_cephfs_9-node-cluster.yaml
+#   (11 VMs: cluster roles node1-7, 4 clients node8-11 — same shape as stock
+#    tier-1_fs / clients suites; filename says "9-node")
+#
+# Scope: CephFS must-pass only · existing modules · no NFS · no new tests
+#        No MDS failover / pinning / multi-MDS restart · no mirror · no upgrade/CephX
+#
+# RUN:
+#   deploy + clients
+#   cephfs_basic_tests
+#   cephfs_volume_management → cephfs_snapshot_management (both use ephemeral cephfs_new)
+#   cephfs_tier1_ops → client_authorize → fs_kernel_mount_options
+#   clients.smallfiles_with_different_operations
+#   clients.multiclients_io_on_same_directory
+#   clients.cross_delete_ops_bw_fuse_and_kernel_clients
+#
+# abort-on-fail: true on setup; false on functionals (stock suite style — require all
+# green at end for the gate bar). Flip functionals to true for fail-fast if desired.
+#
+# OneCloud example:
+#   python3 run.py --rhbuild 6.1 --platform rhel-9 --build <pin> \
+#     --cloud onecloud \
+#     --global-conf conf/quincy/cephfs/tier-2_cephfs_9-node-cluster.yaml \
+#     --suite suites/quincy/cephfs/tier-0_cephfs_must_pass.yaml \
+#     --inventory conf/inventory/onecloud-rhel-9.6-server-x86_64-medium.yaml \
+#     --osp-cred <osp-cred.yaml> \
+#     --instances-name <prefix> \
+#     --skip-subscription --log-level INFO
+#
+# OCP Virt example:
+#   python3 run.py --rhbuild 6.1 --platform rhel-9 --build <pin> \
+#     --cloud ocpvirt \
+#     --global-conf conf/quincy/cephfs/tier-2_cephfs_9-node-cluster.yaml \
+#     --suite suites/quincy/cephfs/tier-0_cephfs_must_pass.yaml \
+#     --inventory conf/inventory/ocpvirt-rhel-9-latest.yaml \
+#     --osp-cred <ocpvirt-cred.yaml> \
+#     --custom-config ocpvirt_namespace=<rdu3_ceph_*> \
+#     --instances-name <prefix> \
+#     --skip-subscription --log-level INFO
+#===============================================================================================
+---
+tests:
+  - test:
+      name: setup install pre-requisistes
+      desc: Setup phase to deploy the required pre-requisites for running the tests.
+      module: install_prereq.py
+      abort-on-fail: true
+
+  - test:
+      name: cluster deployment
+      desc: Deploy cluster with cephfs + cephfs-ec and max_mds=2 (stock tier-1_fs shape).
+      module: test_cephadm.py
+      polarion-id: CEPH-83573740
+      config:
+        verify_cluster_health: true
+        steps:
+          - config:
+              command: bootstrap
+              service: cephadm
+              base_cmd_args:
+                verbose: true
+              args:
+                registry-url: registry.redhat.io
+                mon-ip: node1
+                orphan-initial-daemons: true
+                skip-monitoring-stack: true
+          - config:
+              command: add_hosts
+              service: host
+              args:
+                attach_ip_address: true
+                labels: apply-all-labels
+          - config:
+              command: apply
+              service: mgr
+              args:
+                placement:
+                  label: mgr
+          - config:
+              command: apply
+              service: mon
+              args:
+                placement:
+                  label: mon
+          - config:
+              command: apply
+              service: osd
+              args:
+                all-available-devices: true
+          - config:
+              command: shell
+              args:
+                - ceph
+                - fs
+                - volume
+                - create
+                - cephfs
+          - config:
+              command: shell
+              args:
+                - ceph
+                - osd
+                - pool
+                - create
+                - cephfs-data-ec
+                - "64"
+                - erasure
+          - config:
+              command: shell
+              args:
+                - ceph
+                - osd
+                - pool
+                - create
+                - cephfs-metadata
+                - "64"
+          - config:
+              command: shell
+              args:
+                - ceph
+                - osd
+                - pool
+                - set
+                - cephfs-data-ec
+                - allow_ec_overwrites
+                - "true"
+          - config:
+              command: shell
+              args:
+                - ceph
+                - fs
+                - new
+                - cephfs-ec
+                - cephfs-metadata
+                - cephfs-data-ec
+                - --force
+          - config:
+              command: apply
+              service: mds
+              base_cmd_args:
+                verbose: true
+              pos_args:
+                - cephfs
+              args:
+                placement:
+                  label: mds
+          - config:
+              args:
+                - ceph
+                - fs
+                - set
+                - cephfs
+                - max_mds
+                - "2"
+              command: shell
+      destroy-cluster: false
+      abort-on-fail: true
+
+  - test:
+      abort-on-fail: true
+      config:
+        command: add
+        id: client.1
+        node: node8
+        install_packages:
+          - ceph-common
+          - ceph-fuse
+        copy_admin_keyring: true
+      desc: Configure the Cephfs client system 1
+      destroy-cluster: false
+      module: test_client.py
+      name: configure client
+
+  - test:
+      abort-on-fail: true
+      config:
+        command: add
+        id: client.2
+        node: node9
+        install_packages:
+          - ceph-common
+          - ceph-fuse
+        copy_admin_keyring: true
+      desc: Configure the Cephfs client system 2
+      destroy-cluster: false
+      module: test_client.py
+      name: configure client
+
+  - test:
+      abort-on-fail: true
+      config:
+        command: add
+        id: client.3
+        node: node10
+        install_packages:
+          - ceph-common
+          - ceph-fuse
+        copy_admin_keyring: true
+      desc: Configure the Cephfs client system 3
+      destroy-cluster: false
+      module: test_client.py
+      name: configure client
+
+  - test:
+      abort-on-fail: true
+      config:
+        command: add
+        id: client.4
+        node: node11
+        install_packages:
+          - ceph-common
+          - ceph-fuse
+        copy_admin_keyring: true
+      desc: Configure the Cephfs client system 4
+      destroy-cluster: false
+      module: test_client.py
+      name: configure client
+
+  - test:
+      name: cephfs-basics
+      module: cephfs_basic_tests.py
+      polarion-id: CEPH-11293
+      desc: cephfs basic operations
+      abort-on-fail: false
+
+  - test:
+      name: cephfs_volume_management
+      module: cephfs_volume_management.py
+      polarion-id: CEPH-83573446
+      desc: cephfs volume management
+      abort-on-fail: false
+
+  - test:
+      name: cephfs_snapshot_management
+      module: cephfs_snapshot_management.py
+      polarion-id: CEPH-83573259
+      desc: cephfs snapshot management
+      abort-on-fail: false
+
+  - test:
+      name: cephfs_tier1_ops
+      module: cephfs_tier1_ops.py
+      polarion-id: CEPH-83573447
+      desc: cephfs tier1 operations
+      abort-on-fail: false
+
+  - test:
+      name: cephfs_client_authorize
+      module: client_authorize.py
+      polarion-id: CEPH-83574483
+      desc: client authorize test for cephfs
+      abort-on-fail: false
+
+  - test:
+      name: fs_kernel_mount_options
+      module: fs_kernel_mount_options.py
+      polarion-id: CEPH-83575389
+      desc: Ensure kernel mounts work with all available options and validate each option
+      abort-on-fail: false
+
+  - test:
+      name: smallfile IO on multiple clients with diff operations
+      module: clients.smallfiles_with_different_operations.py
+      polarion-id: CEPH-10625
+      desc: smallfiles with different operations
+      abort-on-fail: false
+
+  - test:
+      name: Mount single directory and perform IO ops from multiple clients
+      module: clients.multiclients_io_on_same_directory.py
+      polarion-id: CEPH-11224
+      desc: multiple clients performing IO on same directory
+      abort-on-fail: false
+
+  - test:
+      name: cross delete operations
+      module: clients.cross_delete_ops_bw_fuse_and_kernel_clients.py
+      polarion-id: CEPH-83573532
+      desc: Cross Delete Ops b/w Fuse and Kernel mounts
+      abort-on-fail: false
