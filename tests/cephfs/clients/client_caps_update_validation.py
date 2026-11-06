@@ -102,6 +102,13 @@ def test_setup(fs_util, ceph_cluster, client):
     return setup_params
 
 
+def normalize_path(path):
+    """Strip trailing slash except for root."""
+    if not path or path == "/":
+        return path
+    return path.rstrip("/")
+
+
 def run_io_local(fs_util, mnt_info, sv_list, wait=True):
     """
     This methods runs IOs in parallel on given mountpoints.
@@ -110,8 +117,11 @@ def run_io_local(fs_util, mnt_info, sv_list, wait=True):
     sv_name:{'path' : path,'client':client}
     }
     If wait=False, returns the list of running threads without joining.
+    Returns: (write_procs, io_targets) where io_targets is a list of
+    {'client': client, 'path': io_path} for progress checks.
     """
     write_procs = []
+    io_targets = []
     rand_str = "".join(random.choice(string.digits) for i in range(3))
     for sv in sv_list:
         sv_name = sv["subvol_name"]
@@ -120,64 +130,197 @@ def run_io_local(fs_util, mnt_info, sv_list, wait=True):
         io_tools = ["smallfile"]
         io_path = f"{mnt_path}/run_ios_{rand_str}"
         mnt_client.exec_command(sudo=True, cmd=f"mkdir -p {io_path}")
+        io_targets.append({"client": mnt_client, "path": io_path})
         p = Thread(target=fs_util.run_ios, args=(mnt_client, io_path, io_tools))
         p.start()
         write_procs.append(p)
     if wait:
         for p in write_procs:
             p.join()
-    return write_procs
+    return write_procs, io_targets
+
+
+def get_io_file_count(mnt_client, io_path):
+    """Return number of regular files under io_path."""
+    out, _ = mnt_client.exec_command(
+        sudo=True, cmd=f"find {io_path} -type f 2>/dev/null | wc -l"
+    )
+    return int(out.strip())
+
+
+def verify_io_paused(io_targets, duration=20, interval=5):
+    """
+    While quiesced, file counts under IO dirs must not increase.
+    Returns True if paused, False if progress detected.
+    """
+    baselines = []
+    for target in io_targets:
+        count = get_io_file_count(target["client"], target["path"])
+        baselines.append(count)
+        log.info(f"IO baseline file count for {target['path']}: {count}")
+
+    elapsed = 0
+    while elapsed < duration:
+        time.sleep(interval)
+        elapsed += interval
+        for idx, target in enumerate(io_targets):
+            current = get_io_file_count(target["client"], target["path"])
+            log.info(
+                f"IO file count after {elapsed}s for {target['path']}: "
+                f"{current} (baseline {baselines[idx]})"
+            )
+            if current > baselines[idx]:
+                log.error(
+                    f"IO progressed during quiesce on {target['path']}: "
+                    f"{baselines[idx]} -> {current}"
+                )
+                return False
+    log.info("IO made no progress during quiesce settle window")
+    return True
+
+
+def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
+    """
+    Find MDS client session by exact subvol root path + mount client hostname.
+    Searches all active MDS. Returns dict with id, num_caps, mds or None.
+    Returns the string 'ambiguous' if more than one match.
+    """
+    expect_root = normalize_path(subvol_path)
+    expect_host = mnt_client.node.hostname
+    matches = []
+    mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
+    retry_exec_command = retry(CommandFailed, tries=3, delay=10)(client.exec_command)
+
+    for mds_name in mds_list:
+        out, _ = retry_exec_command(
+            sudo=True, cmd=f"ceph tell mds.{mds_name} client ls --f json"
+        )
+        client_ls = json.loads(out)
+        for entry in client_ls:
+            meta = entry.get("client_metadata") or {}
+            root = normalize_path(meta.get("root", ""))
+            hostname = meta.get("hostname", "")
+            if root == expect_root and root != "/" and hostname == expect_host:
+                log.info(
+                    f"Matched client session id={entry['id']} mds={mds_name} "
+                    f"root={root} hostname={hostname} num_caps={entry['num_caps']}"
+                )
+                matches.append(
+                    {
+                        "id": entry["id"],
+                        "num_caps": entry["num_caps"],
+                        "mds": mds_name,
+                    }
+                )
+
+    if len(matches) == 0:
+        log.error(
+            f"No client session found for root={expect_root} hostname={expect_host}"
+        )
+        return None
+    if len(matches) > 1:
+        log.error(
+            f"Ambiguous client sessions for root={expect_root} "
+            f"hostname={expect_host}: {matches}"
+        )
+        return "ambiguous"
+    return matches[0]
+
+
+def client_session_exists(client, fs_util, fs_name, client_id):
+    """Return True if client_id is present on any active MDS."""
+    mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
+    for mds_name in mds_list:
+        out, _ = client.exec_command(
+            sudo=True, cmd=f"ceph tell mds.{mds_name} client ls --f json"
+        )
+        client_ls = json.loads(out)
+        for entry in client_ls:
+            if entry.get("id") == client_id:
+                return True
+    return False
 
 
 def client_caps_quiesce_test(
-    client, subvol_path, fs_name, qs_set, cg_snap_util, fs_util
+    client,
+    subvol_path,
+    fs_name,
+    qs_set,
+    cg_snap_util,
+    fs_util,
+    mnt_client,
+    io_targets,
+    io_threads,
 ):
     """
     This method is for Test1: Client caps validation during CG quiesce
     """
-    mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
-    out, _ = client.exec_command(
-        sudo=True, cmd=f"ceph tell mds.{mds_list[0]} client ls --f json"
-    )
-    client_ls = json.loads(out)
-    client_id = ""
-    for i in range(0, len(client_ls)):
-        log.info(client_ls[i])
-        if client_ls[i]["client_metadata"].get("root"):
-            sv_path = client_ls[i]["client_metadata"]["root"]
-            if sv_path in subvol_path and sv_path != "/":
-                caps_before_quiesce = client_ls[i]["num_caps"]
-                client_id = client_ls[i]["id"]
-                log.info(f"client_id is assigned with value {client_id}")
-                break
-    log.info(
-        f"client_id is assigned with value {client_id} After looping through clients"
-    )
+    session = find_client_session(client, fs_util, fs_name, subvol_path, mnt_client)
+    if session is None or session == "ambiguous":
+        log.error("Failed to locate unique client session before quiesce")
+        return 1
+
+    caps_before_quiesce = session["num_caps"]
+    client_id = session["id"]
+    log.info(f"Before quiesce: client_id={client_id}, num_caps={caps_before_quiesce}")
+
     log.info(f"CG quiesce on members:{qs_set}")
     rand_str = "".join(random.choice(string.digits) for i in range(3))
     qs_id_val = f"caps_test_{rand_str}"
-    cg_snap_util.cg_quiesce(
+    qs_out = cg_snap_util.cg_quiesce(
         client, qs_set, qs_id=qs_id_val, fs_name=fs_name, timeout=600, expiration=600
     )
-    time.sleep(5)
+    if qs_out == 1:
+        log.error("CG quiesce command failed validation")
+        return 1
+
+    qs_query = cg_snap_util.get_qs_query(client, qs_id_val, fs_name=fs_name)
+    qs_state = qs_query["sets"][qs_id_val]["state"]["name"]
+    log.info(f"Quiesce set {qs_id_val} state after await: {qs_state}")
+    if qs_state != "QUIESCED":
+        log.error(f"Expected QUIESCED, got {qs_state}")
+        cg_snap_util.cg_quiesce_release(
+            client, qs_id_val, fs_name=fs_name, if_await=True
+        )
+        return 1
+
+    if not any(t.is_alive() for t in io_threads):
+        log.error("IO threads finished before quiesce validation; cannot verify pause")
+        cg_snap_util.cg_quiesce_release(
+            client, qs_id_val, fs_name=fs_name, if_await=True
+        )
+        return 1
+
+    if not verify_io_paused(io_targets, duration=20, interval=5):
+        log.error("IO did not pause while quiesce set was QUIESCED")
+        cg_snap_util.cg_quiesce_release(
+            client, qs_id_val, fs_name=fs_name, if_await=True
+        )
+        return 1
+
+    caps_after_quiesce = caps_before_quiesce
     retry_cnt = 12
     while retry_cnt > 0:
-        out, _ = client.exec_command(
-            sudo=True, cmd=f"ceph tell mds.{mds_list[0]} client ls --f json"
+        session_after = find_client_session(
+            client, fs_util, fs_name, subvol_path, mnt_client
         )
-        client_ls = json.loads(out)
-        for i in range(0, len(client_ls)):
-            if client_id == client_ls[i]["id"]:
-                caps_after_quiesce = client_ls[i]["num_caps"]
+        if session_after is None or session_after == "ambiguous":
+            log.error("Failed to locate client session after quiesce")
+            cg_snap_util.cg_quiesce_release(
+                client, qs_id_val, fs_name=fs_name, if_await=True
+            )
+            return 1
+        caps_after_quiesce = session_after["num_caps"]
         log.info(
-            f"Client Caps Before quiesce : {caps_before_quiesce},Clients Caps After quiesce : {caps_after_quiesce}"
+            f"Client Caps Before quiesce : {caps_before_quiesce},"
+            f"Clients Caps After quiesce : {caps_after_quiesce}"
         )
-
         if caps_after_quiesce >= caps_before_quiesce:
             retry_cnt -= 1
             time.sleep(5)
         else:
-            retry_cnt = 0
+            break
+
     cg_snap_util.cg_quiesce_release(client, qs_id_val, fs_name=fs_name, if_await=True)
     if caps_after_quiesce >= caps_before_quiesce:
         log.error("Clients caps are not revoked during CG quiesce")
@@ -186,39 +329,49 @@ def client_caps_quiesce_test(
 
 
 def client_caps_mds_failover_test(
-    client, fs_name, cephfs_common_utils, fs_util, subvol_path
+    client, fs_name, cephfs_common_utils, fs_util, subvol_path, mnt_client
 ):
     """
     This method is for Test2: Client caps validation during MDS failover
     """
-    mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
     log.info("Capture Caps info before mds failover")
-    out, _ = client.exec_command(
-        sudo=True, cmd=f"ceph tell mds.{mds_list[0]} client ls --f json"
+    session_before = find_client_session(
+        client, fs_util, fs_name, subvol_path, mnt_client
     )
-    client_ls = json.loads(out)
-    for i in range(0, len(client_ls)):
-        log.info(client_ls[i])
-        if client_ls[i]["client_metadata"].get("root"):
-            sv_path = client_ls[i]["client_metadata"]["root"]
-            if sv_path in subvol_path and sv_path != "/":
-                caps_before_mds_fail = client_ls[i]["num_caps"]
-                client_id = client_ls[i]["id"]
-                break
-    log.info("Perform MDS failover")
-    mds_failover(cephfs_common_utils, client, fs_name)
-    log.info("Capture Caps info after mds failover")
-    mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
-    retry_exec_command = retry(CommandFailed, tries=3, delay=30)(client.exec_command)
-    out, _ = retry_exec_command(
-        sudo=True, cmd=f"ceph tell mds.{mds_list[0]} client ls --f json"
-    )
-    client_ls = json.loads(out)
-    for i in range(0, len(client_ls)):
-        if client_id == client_ls[i]["id"]:
-            caps_after_mds_fail = client_ls[i]["num_caps"]
+    if session_before is None or session_before == "ambiguous":
+        log.error("Failed to locate unique client session before MDS failover")
+        return 1
+    caps_before_mds_fail = session_before["num_caps"]
     log.info(
-        f"Client Caps Before MDS fail:{caps_before_mds_fail},Clients Caps After MDS fail:{caps_after_mds_fail}"
+        f"Before MDS fail: client_id={session_before['id']}, "
+        f"num_caps={caps_before_mds_fail}"
+    )
+
+    log.info("Perform MDS failover")
+    if mds_failover(cephfs_common_utils, client, fs_name):
+        log.error("MDS failover helper failed")
+        return 1
+
+    log.info("Capture Caps info after mds failover")
+    session_after = None
+    for attempt in range(3):
+        session_after = find_client_session(
+            client, fs_util, fs_name, subvol_path, mnt_client
+        )
+        if session_after and session_after != "ambiguous":
+            break
+        log.info(f"Client session not found after failover, retry {attempt + 1}/3")
+        time.sleep(30)
+
+    if session_after is None or session_after == "ambiguous":
+        log.error("Failed to locate client session after MDS failover")
+        return 1
+
+    caps_after_mds_fail = session_after["num_caps"]
+    log.info(
+        f"Client Caps Before MDS fail:{caps_before_mds_fail},"
+        f"Clients Caps After MDS fail:{caps_after_mds_fail} "
+        f"(client_id after={session_after['id']})"
     )
     if caps_after_mds_fail >= caps_before_mds_fail:
         log.error("Clients caps are not updated during MDS failover")
@@ -230,24 +383,30 @@ def client_caps_evict_test(client, subvol_path, mnt_client, mnt_pt, fs_name, fs_
     """
     This is method for Test3: Client caps validation when client evicted
     """
-    mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
-    out, _ = client.exec_command(
-        sudo=True, cmd=f"ceph tell mds.{mds_list[0]} client ls --f json"
-    )
-    client_ls = json.loads(out)
+    session = find_client_session(client, fs_util, fs_name, subvol_path, mnt_client)
+    if session is None or session == "ambiguous":
+        log.error("Failed to locate unique client session before eviction")
+        return 1
 
-    for i in range(0, len(client_ls)):
-        log.info(client_ls[i])
-        if client_ls[i]["client_metadata"].get("root"):
-            sv_path = client_ls[i]["client_metadata"]["root"]
-            if sv_path in subvol_path and sv_path != "/":
-                caps_before_evict = client_ls[i]["num_caps"]
-                client_id = client_ls[i]["id"]
-                log.info(f"Evicting Client with ID : {client_id}")
-                cmd = f"ceph tell mds.{mds_list[0]} client evict id={client_id}"
-                client.exec_command(sudo=True, cmd=cmd)
-                time.sleep(2)
-                break
+    client_id = session["id"]
+    mds_name = session["mds"]
+    caps_before_evict = session["num_caps"]
+    log.info(
+        f"Evicting Client with ID : {client_id} on mds.{mds_name} "
+        f"(num_caps={caps_before_evict})"
+    )
+    cmd = f"ceph tell mds.{mds_name} client evict id={client_id}"
+    client.exec_command(sudo=True, cmd=cmd)
+    time.sleep(2)
+
+    if client_session_exists(client, fs_util, fs_name, client_id):
+        log.error(f"Client session id={client_id} still present after eviction")
+        return 1
+    log.info(
+        f"Client session id={client_id} removed after eviction "
+        f"(caps before evict were {caps_before_evict})"
+    )
+
     log.info(f"Unmount and Remount {subvol_path} as Client session was evicted")
     mnt_client.exec_command(sudo=True, cmd=f"umount -l {mnt_pt}")
     mnt_params = {
@@ -258,22 +417,6 @@ def client_caps_evict_test(client, subvol_path, mnt_client, mnt_pt, fs_name, fs_
     }
     mnt_params.update({"export_created": 0})
     fs_util.mount_ceph("fuse", mnt_params)
-
-    out, _ = client.exec_command(
-        sudo=True, cmd=f"ceph tell mds.{mds_list[0]} client ls --f json"
-    )
-    client_ls = json.loads(out)
-    for i in range(0, len(client_ls)):
-        if client_ls[i]["client_metadata"].get("root"):
-            sv_path = client_ls[i]["client_metadata"]["root"]
-            if sv_path in subvol_path and sv_path != "/":
-                caps_after_evict = client_ls[i]["num_caps"]
-    log.info(
-        f"Client Caps Before Evict : {caps_before_evict},Clients Caps After Evict : {caps_after_evict}"
-    )
-    if caps_after_evict >= caps_before_evict:
-        log.error("Clients caps are not revoked during Client eviction")
-        return 1
     return 0
 
 
@@ -284,7 +427,6 @@ def mds_failover(cephfs_common_utils, client, fs_name):
     out, rc = client.exec_command(
         sudo=True, cmd=f"ceph fs status {fs_name} --format json"
     )
-    output = json.loads(out)
     output = json.loads(out)
     active_mds_list = [
         mds["name"]
@@ -346,6 +488,14 @@ def run(ceph_cluster, **kw):
         3. Check if client caps are updated when client session is evicted
 
     """
+    mnt_info = {}
+    sv_list = []
+    fs_name = "cephfs"
+    group_name = None
+    client = None
+    fs_util_v1 = None
+    cephfs_common_utils = None
+
     try:
         fs_util_v1 = FsUtilsV1(ceph_cluster)
         cg_snap_util = CG_Snap_Utils(ceph_cluster)
@@ -386,6 +536,7 @@ def run(ceph_cluster, **kw):
         setup_params = test_setup(fs_util_v1, ceph_cluster, client)
         fs_name = setup_params["default_fs"]
         sv_list = setup_params["sv_list"]
+        group_name = setup_params["subvolumegroup"]["group_name"]
         qs_set = []
         for sv in sv_list:
             if sv.get("group_name"):
@@ -404,7 +555,6 @@ def run(ceph_cluster, **kw):
             "nfs_export_name": setup_params["nfs_export_name"],
             "nfs_server": setup_params["nfs_server"],
         }
-        mnt_info = {}
         sv_path_dict = {}
         sv_name_list = []
         for sv in sv_list:
@@ -432,14 +582,23 @@ def run(ceph_cluster, **kw):
         log.info(
             "Test1:Validate Client Caps recalled when CG quiesce is run on subvolumes"
         )
-        io_threads = run_io_local(fs_util_v1, mnt_info, sv_list, wait=False)
+        io_threads, io_targets = run_io_local(fs_util_v1, mnt_info, sv_list, wait=False)
         time.sleep(5)
 
         sv_name = random.choice(sv_name_list)
         subvol_path = sv_path_dict[sv_name]
+        mnt_client = mnt_info[sv_name]["client"]
         if (
             client_caps_quiesce_test(
-                client, subvol_path, fs_name, qs_set, cg_snap_util, fs_util_v1
+                client,
+                subvol_path,
+                fs_name,
+                qs_set,
+                cg_snap_util,
+                fs_util_v1,
+                mnt_client,
+                io_targets,
+                io_threads,
             )
             == 1
         ):
@@ -453,9 +612,15 @@ def run(ceph_cluster, **kw):
         log.info("Test2:Check if client caps are recalled when MDS failover happens")
         sv_name = random.choice(sv_name_list)
         subvol_path = sv_path_dict[sv_name]
+        mnt_client = mnt_info[sv_name]["client"]
         if (
             client_caps_mds_failover_test(
-                client, fs_name, cephfs_common_utils, fs_util_v1, subvol_path
+                client,
+                fs_name,
+                cephfs_common_utils,
+                fs_util_v1,
+                subvol_path,
+                mnt_client,
             )
             == 1
         ):
@@ -490,34 +655,38 @@ def run(ceph_cluster, **kw):
         return 1
     finally:
         log.info("Cleaning up the system")
-
-        crash_status_after = fs_util_v1.get_crash_ls_new(client)
-        log.info(f"Crash status after Test: {crash_status_after}")
-        wait_time_secs = 300
-        if cephfs_common_utils.wait_for_healthy_ceph(client, wait_time_secs):
-            assert False, "Cluster health is not OK even after waiting for sometime"
-        log.info("Cluster Health is OK")
-        for sv in mnt_info:
-            mnt_pt = mnt_info[sv]["path"]
-            client_tmp = mnt_info[sv]["client"]
-            try:
-                out, rc = client_tmp.exec_command(
-                    sudo=True,
-                    cmd=f"umount -l {mnt_pt}",
+        if client is None or fs_util_v1 is None or cephfs_common_utils is None:
+            log.error("Skipping cleanup; setup did not complete")
+        else:
+            crash_status_after = fs_util_v1.get_crash_ls_new(client)
+            log.info(f"Crash status after Test: {crash_status_after}")
+            wait_time_secs = 300
+            if cephfs_common_utils.wait_for_healthy_ceph(client, wait_time_secs):
+                log.error("Cluster health is not OK even after waiting for sometime")
+            else:
+                log.info("Cluster Health is OK")
+            for sv in mnt_info:
+                mnt_pt = mnt_info[sv]["path"]
+                client_tmp = mnt_info[sv]["client"]
+                try:
+                    out, rc = client_tmp.exec_command(
+                        sudo=True,
+                        cmd=f"umount -l {mnt_pt}",
+                    )
+                except BaseException as ex:
+                    log.info(ex)
+                    if "not mounted" not in str(ex):
+                        log.error("Unmount failed with unexpected reason")
+            for sv in sv_list:
+                subvol_name = sv["subvol_name"]
+                fs_util_v1.remove_subvolume(
+                    client,
+                    fs_name,
+                    subvol_name,
+                    validate=True,
+                    group_name=sv.get("group_name", None),
                 )
-            except BaseException as ex:
-                log.info(ex)
-                if "not mounted" not in str(ex):
-                    log.error("Unmount failed with unexpected reason")
-        for sv in sv_list:
-            subvol_name = sv["subvol_name"]
-            fs_util_v1.remove_subvolume(
-                client,
-                fs_name,
-                subvol_name,
-                validate=True,
-                group_name=sv.get("group_name", None),
-            )
-            if sv.get("group_name"):
-                group_name = sv["group_name"]
-        fs_util_v1.remove_subvolumegroup(client, fs_name, group_name, validate=True)
+            if group_name:
+                fs_util_v1.remove_subvolumegroup(
+                    client, fs_name, group_name, validate=True
+                )
