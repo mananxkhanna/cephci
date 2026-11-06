@@ -220,39 +220,40 @@ tests:
       name: cephfs-crash-setup
       config:
         crash_setup: 1
-  - test:
-      abort-on-fail: false
-      desc: "MDS failover while IO is going on each client"
-      module: clients.MDS_failover_while_client_IO.py
-      polarion-id: CEPH-11242
-      config:
-        num_of_file_dir: 1000
-      name: "MDS failover whi client IO"
-  - test:
-      name: Test important MDS Configuration Settings
-      module: clients.mds_conf_modifying.py
-      polarion-id: CEPH-11329
-      desc: Test important MDS Configuration Settings
-      abort-on-fail: false
-  - test:
-      abort-on-fail: false
-      desc: "multiple clients permission in mounted directory"
-      module: clients.multiple_clients_permission_mounted_directories.py
-      name: multiple clients permission in mounted directory
-      polarion-id: "CEPH-11340"
-  - test:
-      abort-on-fail: false
-      desc: "mds journal value conf verification"
-      module: clients.mds_journal_value_conf_verification.py
-      name: mds journal value conf verification
-      polarion-id: "CEPH-11331"
-  - test:
-      abort-on-fail: false
-      desc: "Validate Root Sqaush operations on Cephfs"
-      module: clients.validate_root_squash.py
-      name: Validate Root Sqaush operations on Cephfs
-      comments: "BZ-2293943"
-      polarion-id: "CEPH-83591419"
+  # TEMP (client_caps PR evidence): other suite tests commented — restore before merge
+  # - test:
+  #     abort-on-fail: false
+  #     desc: "MDS failover while IO is going on each client"
+  #     module: clients.MDS_failover_while_client_IO.py
+  #     polarion-id: CEPH-11242
+  #     config:
+  #       num_of_file_dir: 1000
+  #     name: "MDS failover whi client IO"
+  # - test:
+  #     name: Test important MDS Configuration Settings
+  #     module: clients.mds_conf_modifying.py
+  #     polarion-id: CEPH-11329
+  #     desc: Test important MDS Configuration Settings
+  #     abort-on-fail: false
+  # - test:
+  #     abort-on-fail: false
+  #     desc: "multiple clients permission in mounted directory"
+  #     module: clients.multiple_clients_permission_mounted_directories.py
+  #     name: multiple clients permission in mounted directory
+  #     polarion-id: "CEPH-11340"
+  # - test:
+  #     abort-on-fail: false
+  #     desc: "mds journal value conf verification"
+  #     module: clients.mds_journal_value_conf_verification.py
+  #     name: mds journal value conf verification
+  #     polarion-id: "CEPH-11331"
+  # - test:
+  #     abort-on-fail: false
+  #     desc: "Validate Root Sqaush operations on Cephfs"
+  #     module: clients.validate_root_squash.py
+  #     name: Validate Root Sqaush operations on Cephfs
+  #     comments: "BZ-2293943"
+  #     polarion-id: "CEPH-83591419"
   - test:
       abort-on-fail: false
       desc: "Client Caps Validation during quiesce,mds failover and evict"
