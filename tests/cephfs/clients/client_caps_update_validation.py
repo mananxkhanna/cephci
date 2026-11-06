@@ -183,7 +183,10 @@ def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
     """
     Find MDS client session by exact subvol root path + mount client hostname.
     Searches all active MDS. Returns dict with id, num_caps, mds or None.
-    Returns the string 'ambiguous' if more than one match.
+    Returns the string 'ambiguous' if more than one distinct client id matches.
+
+    With max_mds>1 the same client id often appears on multiple MDS ranks with
+    different num_caps; keep the rank that holds the most caps for that id.
     """
     expect_root = normalize_path(subvol_path)
     expect_host = mnt_client.node.hostname
@@ -218,13 +221,29 @@ def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
             f"No client session found for root={expect_root} hostname={expect_host}"
         )
         return None
-    if len(matches) > 1:
+
+    # Same session id on multiple MDS: pick the rank with the most caps.
+    by_id = {}
+    for match in matches:
+        cid = match["id"]
+        if cid not in by_id or match["num_caps"] > by_id[cid]["num_caps"]:
+            by_id[cid] = match
+    unique = list(by_id.values())
+
+    if len(unique) > 1:
         log.error(
             f"Ambiguous client sessions for root={expect_root} "
-            f"hostname={expect_host}: {matches}"
+            f"hostname={expect_host}: {unique}"
         )
         return "ambiguous"
-    return matches[0]
+
+    chosen = unique[0]
+    if len(matches) > 1:
+        log.info(
+            f"Session id={chosen['id']} seen on {len(matches)} MDS entries; "
+            f"using mds={chosen['mds']} num_caps={chosen['num_caps']}"
+        )
+    return chosen
 
 
 def client_session_exists(client, fs_util, fs_name, client_id):
