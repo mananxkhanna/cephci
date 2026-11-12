@@ -140,22 +140,51 @@ def run_io_local(fs_util, mnt_info, sv_list, wait=True):
     return write_procs, io_targets
 
 
-def get_io_file_count(mnt_client, io_path):
-    """Return number of regular files under io_path."""
-    out, _ = mnt_client.exec_command(
-        sudo=True, cmd=f"find {io_path} -type f 2>/dev/null | wc -l"
+def get_io_file_count(mnt_client, io_path, cmd_timeout=30):
+    """
+    Return number of regular files under io_path, or None if sampling fails.
+
+    Bound the remote find: under CG quiesce, unbounded find can stall until the
+    cephci SSH default (600s), past quiesce expiration, and produce false
+    "IO progressed" after the set expires.
+    """
+    # pipefail so timeout/find failures are not masked by wc exiting 0
+    cmd = (
+        f"timeout {cmd_timeout} bash -o pipefail -c "
+        f"'find {io_path} -type f 2>/dev/null | wc -l'"
     )
-    return int(out.strip())
+    out, err = mnt_client.exec_command(
+        sudo=True, cmd=cmd, timeout=cmd_timeout + 15, check_ec=False
+    )
+    exit_status = getattr(mnt_client, "exit_status", 0)
+    if exit_status != 0:
+        log.warning(
+            f"IO file count failed for {io_path}: exit={exit_status} "
+            f"err={str(err).strip() if err else ''}"
+        )
+        return None
+    try:
+        return int(str(out).strip())
+    except (TypeError, ValueError):
+        log.warning(f"IO file count parse failed for {io_path}: out={out!r}")
+        return None
 
 
 def verify_io_paused(io_targets, duration=20, interval=5):
     """
     While quiesced, file counts under IO dirs must not increase.
-    Returns True if paused, False if progress detected.
+
+    Returns:
+        True  — no progress over the settle window
+        False — progress detected
+        None  — could not sample one or more IO dirs in time
     """
     baselines = []
     for target in io_targets:
         count = get_io_file_count(target["client"], target["path"])
+        if count is None:
+            log.error(f"Could not sample IO baseline for {target['path']}")
+            return None
         baselines.append(count)
         log.info(f"IO baseline file count for {target['path']}: {count}")
 
@@ -165,6 +194,12 @@ def verify_io_paused(io_targets, duration=20, interval=5):
         elapsed += interval
         for idx, target in enumerate(io_targets):
             current = get_io_file_count(target["client"], target["path"])
+            if current is None:
+                log.error(
+                    f"Could not sample IO count for {target['path']} "
+                    f"after {elapsed}s"
+                )
+                return None
             log.info(
                 f"IO file count after {elapsed}s for {target['path']}: "
                 f"{current} (baseline {baselines[idx]})"
@@ -177,6 +212,28 @@ def verify_io_paused(io_targets, duration=20, interval=5):
                 return False
     log.info("IO made no progress during quiesce settle window")
     return True
+
+
+def get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name):
+    """Return quiesce set state name, or None if query fails."""
+    try:
+        qs_query = cg_snap_util.get_qs_query(client, qs_id_val, fs_name=fs_name)
+        return qs_query["sets"][qs_id_val]["state"]["name"]
+    except Exception as exc:
+        log.warning(f"Failed to query quiesce set {qs_id_val}: {exc}")
+        return None
+
+
+def safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name):
+    """Release quiesce set; log and continue if already expired/released."""
+    try:
+        cg_snap_util.cg_quiesce_release(
+            client, qs_id_val, fs_name=fs_name, if_await=True
+        )
+    except CommandFailed as exc:
+        log.warning(
+            f"Quiesce release of {qs_id_val} failed (set may have expired): {exc}"
+        )
 
 
 def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
@@ -296,28 +353,45 @@ def client_caps_quiesce_test(
         log.error("CG quiesce command failed validation")
         return 1
 
-    qs_query = cg_snap_util.get_qs_query(client, qs_id_val, fs_name=fs_name)
-    qs_state = qs_query["sets"][qs_id_val]["state"]["name"]
+    qs_state = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
     log.info(f"Quiesce set {qs_id_val} state after await: {qs_state}")
     if qs_state != "QUIESCED":
         log.error(f"Expected QUIESCED, got {qs_state}")
-        cg_snap_util.cg_quiesce_release(
-            client, qs_id_val, fs_name=fs_name, if_await=True
-        )
+        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
         return 1
 
     if not any(t.is_alive() for t in io_threads):
         log.error("IO threads finished before quiesce validation; cannot verify pause")
-        cg_snap_util.cg_quiesce_release(
-            client, qs_id_val, fs_name=fs_name, if_await=True
-        )
+        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
         return 1
 
-    if not verify_io_paused(io_targets, duration=20, interval=5):
-        log.error("IO did not pause while quiesce set was QUIESCED")
-        cg_snap_util.cg_quiesce_release(
-            client, qs_id_val, fs_name=fs_name, if_await=True
+    # Keep settle well inside quiesce expiration (default 600s).
+    pause_result = verify_io_paused(io_targets, duration=20, interval=5)
+    qs_state_after = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
+    log.info(f"Quiesce set {qs_id_val} state after IO pause check: {qs_state_after}")
+
+    if pause_result is None:
+        log.error(
+            "Could not sample IO dirs under quiesce in time "
+            f"(set state now={qs_state_after})"
         )
+        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
+        return 1
+    if pause_result is False:
+        if qs_state_after != "QUIESCED":
+            log.error(
+                "IO count rose after quiesce left QUIESCED "
+                f"(state={qs_state_after}); pause check unreliable past expiration"
+            )
+        else:
+            log.error("IO did not pause while quiesce set was QUIESCED")
+        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
+        return 1
+    if qs_state_after != "QUIESCED":
+        log.error(
+            f"Quiesce set left QUIESCED during IO pause check (state={qs_state_after})"
+        )
+        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
         return 1
 
     session_after = find_client_session(
@@ -335,7 +409,7 @@ def client_caps_quiesce_test(
             f"(informational; write-only revoke, drop not required)"
         )
 
-    cg_snap_util.cg_quiesce_release(client, qs_id_val, fs_name=fs_name, if_await=True)
+    safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
     return 0
 
 
