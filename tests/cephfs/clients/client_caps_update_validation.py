@@ -1,5 +1,6 @@
 import json
 import random
+import shlex
 import string
 import time
 import traceback
@@ -32,7 +33,7 @@ def test_setup(fs_util, ceph_cluster, client):
     for line in out_list:
         if "max_mds" in line:
             str, max_mds_val = line.split()
-            log.info(f"max_mds before test {max_mds_val}")
+            log.info("max_mds before test %s", max_mds_val)
     out, rc = client.exec_command(
         sudo=True, cmd=f"ceph fs status {default_fs} --format json"
     )
@@ -109,19 +110,42 @@ def normalize_path(path):
     return path.rstrip("/")
 
 
-def run_io_local(fs_util, mnt_info, sv_list, wait=True):
+def join_io_threads(write_procs, io_error_slots, timeout=600):
+    """
+    Join IO threads with a bound. io_error_slots[i] is a one-element list
+    updated by the thread on failure. Return 0 if all finished cleanly, 1 if
+    any are still alive after timeout or recorded an exception.
+    """
+    rc = 0
+    for idx, proc in enumerate(write_procs):
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            log.error("IO thread still running after %ss (index=%s)", timeout, idx)
+            rc = 1
+        err = None
+        if idx < len(io_error_slots):
+            err = io_error_slots[idx][0]
+        if err is not None:
+            log.error("IO thread index=%s failed: %s", idx, err)
+            rc = 1
+    return rc
+
+
+def run_io_local(fs_util, mnt_info, sv_list, wait=True, join_timeout=600):
     """
     This methods runs IOs in parallel on given mountpoints.
     mnt_info : dict type input, with below format,
     {
     sv_name:{'path' : path,'client':client}
     }
-    If wait=False, returns the list of running threads without joining.
-    Returns: (write_procs, io_targets) where io_targets is a list of
-    {'client': client, 'path': io_path} for progress checks.
+    If wait=False, returns without joining.
+    Returns: (write_procs, io_targets, io_error_slots) where io_targets is a
+    list of {'client': client, 'path': io_path} and io_error_slots[i][0] is set
+    if thread i raised.
     """
     write_procs = []
     io_targets = []
+    io_error_slots = []
     rand_str = "".join(random.choice(string.digits) for i in range(3))
     for sv in sv_list:
         sv_name = sv["subvol_name"]
@@ -131,13 +155,32 @@ def run_io_local(fs_util, mnt_info, sv_list, wait=True):
         io_path = f"{mnt_path}/run_ios_{rand_str}"
         mnt_client.exec_command(sudo=True, cmd=f"mkdir -p {io_path}")
         io_targets.append({"client": mnt_client, "path": io_path})
-        p = Thread(target=fs_util.run_ios, args=(mnt_client, io_path, io_tools))
-        p.start()
-        write_procs.append(p)
+        err_slot = [None]
+
+        def _io_target(
+            client=mnt_client,
+            path=io_path,
+            tools=io_tools,
+            slot=err_slot,
+        ):
+            try:
+                fs_util.run_ios(client, path, tools)
+            except Exception as exc:
+                log.error("IO thread failed on %s: %s", path, exc)
+                log.error(traceback.format_exc())
+                slot[0] = exc
+
+        proc = Thread(target=_io_target)
+        io_error_slots.append(err_slot)
+        proc.start()
+        write_procs.append(proc)
     if wait:
-        for p in write_procs:
-            p.join()
-    return write_procs, io_targets
+        if join_io_threads(write_procs, io_error_slots, timeout=join_timeout) == 1:
+            raise CommandFailed(
+                "Background IO threads failed or timed out: "
+                f"{[slot[0] for slot in io_error_slots]}"
+            )
+    return write_procs, io_targets, io_error_slots
 
 
 def get_io_file_count(mnt_client, io_path, cmd_timeout=30):
@@ -147,26 +190,28 @@ def get_io_file_count(mnt_client, io_path, cmd_timeout=30):
     Bound the remote find: under CG quiesce, unbounded find can stall until the
     cephci SSH default (600s), past quiesce expiration, and produce false
     "IO progressed" after the set expires.
+
+    Exit status lives on mnt_client.node (CephObject.exec_command is a proxy).
     """
     # pipefail so timeout/find failures are not masked by wc exiting 0
-    cmd = (
-        f"timeout {cmd_timeout} bash -o pipefail -c "
-        f"'find {io_path} -type f 2>/dev/null | wc -l'"
-    )
+    inner = f"find {shlex.quote(io_path)} -type f 2>/dev/null | wc -l"
+    cmd = f"timeout {cmd_timeout} bash -o pipefail -c {shlex.quote(inner)}"
     out, err = mnt_client.exec_command(
         sudo=True, cmd=cmd, timeout=cmd_timeout + 15, check_ec=False
     )
-    exit_status = getattr(mnt_client, "exit_status", 0)
+    exit_status = mnt_client.node.exit_status
     if exit_status != 0:
         log.warning(
-            f"IO file count failed for {io_path}: exit={exit_status} "
-            f"err={str(err).strip() if err else ''}"
+            "IO file count failed for %s: exit=%s err=%s",
+            io_path,
+            exit_status,
+            str(err).strip() if err else "",
         )
         return None
     try:
         return int(str(out).strip())
     except (TypeError, ValueError):
-        log.warning(f"IO file count parse failed for {io_path}: out={out!r}")
+        log.warning("IO file count parse failed for %s: out=%r", io_path, out)
         return None
 
 
@@ -183,10 +228,10 @@ def verify_io_paused(io_targets, duration=20, interval=5):
     for target in io_targets:
         count = get_io_file_count(target["client"], target["path"])
         if count is None:
-            log.error(f"Could not sample IO baseline for {target['path']}")
+            log.error("Could not sample IO baseline for %s", target["path"])
             return None
         baselines.append(count)
-        log.info(f"IO baseline file count for {target['path']}: {count}")
+        log.info("IO baseline file count for %s: %s", target["path"], count)
 
     elapsed = 0
     while elapsed < duration:
@@ -196,18 +241,24 @@ def verify_io_paused(io_targets, duration=20, interval=5):
             current = get_io_file_count(target["client"], target["path"])
             if current is None:
                 log.error(
-                    f"Could not sample IO count for {target['path']} "
-                    f"after {elapsed}s"
+                    "Could not sample IO count for %s after %ss",
+                    target["path"],
+                    elapsed,
                 )
                 return None
             log.info(
-                f"IO file count after {elapsed}s for {target['path']}: "
-                f"{current} (baseline {baselines[idx]})"
+                "IO file count after %ss for %s: %s (baseline %s)",
+                elapsed,
+                target["path"],
+                current,
+                baselines[idx],
             )
             if current > baselines[idx]:
                 log.error(
-                    f"IO progressed during quiesce on {target['path']}: "
-                    f"{baselines[idx]} -> {current}"
+                    "IO progressed during quiesce on %s: %s -> %s",
+                    target["path"],
+                    baselines[idx],
+                    current,
                 )
                 return False
     log.info("IO made no progress during quiesce settle window")
@@ -220,7 +271,7 @@ def get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name):
         qs_query = cg_snap_util.get_qs_query(client, qs_id_val, fs_name=fs_name)
         return qs_query["sets"][qs_id_val]["state"]["name"]
     except Exception as exc:
-        log.warning(f"Failed to query quiesce set {qs_id_val}: {exc}")
+        log.warning("Failed to query quiesce set %s: %s", qs_id_val, exc)
         return None
 
 
@@ -232,15 +283,15 @@ def safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name):
         )
     except CommandFailed as exc:
         log.warning(
-            f"Quiesce release of {qs_id_val} failed (set may have expired): {exc}"
+            "Quiesce release of %s failed (set may have expired): %s", qs_id_val, exc
         )
 
 
 def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
     """
     Find MDS client session by exact subvol root path + mount client hostname.
-    Searches all active MDS. Returns dict with id, num_caps, mds or None.
-    Returns the string 'ambiguous' if more than one distinct client id matches.
+    Searches all active MDS. Returns dict with id, num_caps, mds — or None if
+    missing or ambiguous (more than one distinct client id).
 
     With max_mds>1 the same client id often appears on multiple MDS ranks with
     different num_caps; keep the rank that holds the most caps for that id.
@@ -262,8 +313,12 @@ def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
             hostname = meta.get("hostname", "")
             if root == expect_root and root != "/" and hostname == expect_host:
                 log.info(
-                    f"Matched client session id={entry['id']} mds={mds_name} "
-                    f"root={root} hostname={hostname} num_caps={entry['num_caps']}"
+                    "Matched client session id=%s mds=%s root=%s hostname=%s num_caps=%s",
+                    entry["id"],
+                    mds_name,
+                    root,
+                    hostname,
+                    entry["num_caps"],
                 )
                 matches.append(
                     {
@@ -275,7 +330,7 @@ def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
 
     if len(matches) == 0:
         log.error(
-            f"No client session found for root={expect_root} hostname={expect_host}"
+            "No client session found for root=%s hostname=%s", expect_root, expect_host
         )
         return None
 
@@ -289,16 +344,21 @@ def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
 
     if len(unique) > 1:
         log.error(
-            f"Ambiguous client sessions for root={expect_root} "
-            f"hostname={expect_host}: {unique}"
+            "Ambiguous client sessions for root=%s hostname=%s: %s",
+            expect_root,
+            expect_host,
+            unique,
         )
-        return "ambiguous"
+        return None
 
     chosen = unique[0]
     if len(matches) > 1:
         log.info(
-            f"Session id={chosen['id']} seen on {len(matches)} MDS entries; "
-            f"using mds={chosen['mds']} num_caps={chosen['num_caps']}"
+            "Session id=%s seen on %s MDS entries; using mds=%s num_caps=%s",
+            chosen["id"],
+            len(matches),
+            chosen["mds"],
+            chosen["num_caps"],
         )
     return chosen
 
@@ -306,8 +366,9 @@ def find_client_session(client, fs_util, fs_name, subvol_path, mnt_client):
 def client_session_exists(client, fs_util, fs_name, client_id):
     """Return True if client_id is present on any active MDS."""
     mds_list = fs_util.get_active_mdss(client, fs_name=fs_name)
+    retry_exec_command = retry(CommandFailed, tries=3, delay=10)(client.exec_command)
     for mds_name in mds_list:
-        out, _ = client.exec_command(
+        out, _ = retry_exec_command(
             sudo=True, cmd=f"ceph tell mds.{mds_name} client ls --f json"
         )
         client_ls = json.loads(out)
@@ -331,19 +392,22 @@ def client_caps_quiesce_test(
     """
     Test1: CG quiesce — pass on QUIESCED + IO pause.
 
-    Quiesce revokes write caps only; aggregate num_caps is not expected to
-    decrease, so it is logged for visibility and is not a pass/fail check.
+    Intentional change: aggregate client ls num_caps is not a pass/fail check.
+    Quiesce revokes write caps only; num_caps need not decrease (MDS/dev).
+    Logged before/after for visibility only.
     """
     session = find_client_session(client, fs_util, fs_name, subvol_path, mnt_client)
-    if session is None or session == "ambiguous":
+    if not session:
         log.error("Failed to locate unique client session before quiesce")
         return 1
 
     caps_before_quiesce = session["num_caps"]
     client_id = session["id"]
-    log.info(f"Before quiesce: client_id={client_id}, num_caps={caps_before_quiesce}")
+    log.info(
+        "Before quiesce: client_id=%s, num_caps=%s", client_id, caps_before_quiesce
+    )
 
-    log.info(f"CG quiesce on members:{qs_set}")
+    log.info("CG quiesce on members:%s", qs_set)
     rand_str = "".join(random.choice(string.digits) for i in range(3))
     qs_id_val = f"caps_test_{rand_str}"
     qs_out = cg_snap_util.cg_quiesce(
@@ -353,64 +417,67 @@ def client_caps_quiesce_test(
         log.error("CG quiesce command failed validation")
         return 1
 
-    qs_state = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
-    log.info(f"Quiesce set {qs_id_val} state after await: {qs_state}")
-    if qs_state != "QUIESCED":
-        log.error(f"Expected QUIESCED, got {qs_state}")
-        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
-        return 1
+    # Always release once quiesce succeeded (covers early returns and exceptions).
+    try:
+        qs_state = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
+        log.info("Quiesce set %s state after await: %s", qs_id_val, qs_state)
+        if qs_state != "QUIESCED":
+            log.error("Expected QUIESCED, got %s", qs_state)
+            return 1
 
-    if not any(t.is_alive() for t in io_threads):
-        log.error("IO threads finished before quiesce validation; cannot verify pause")
-        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
-        return 1
+        if not any(t.is_alive() for t in io_threads):
+            log.error(
+                "IO threads finished before quiesce validation; cannot verify pause"
+            )
+            return 1
 
-    # Keep settle well inside quiesce expiration (default 600s).
-    pause_result = verify_io_paused(io_targets, duration=20, interval=5)
-    qs_state_after = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
-    log.info(f"Quiesce set {qs_id_val} state after IO pause check: {qs_state_after}")
-
-    if pause_result is None:
-        log.error(
-            "Could not sample IO dirs under quiesce in time "
-            f"(set state now={qs_state_after})"
+        # Keep settle well inside quiesce expiration (default 600s).
+        pause_result = verify_io_paused(io_targets, duration=20, interval=5)
+        qs_state_after = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
+        log.info(
+            "Quiesce set %s state after IO pause check: %s", qs_id_val, qs_state_after
         )
-        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
-        return 1
-    if pause_result is False:
+
+        if pause_result is None:
+            log.error(
+                "Could not sample IO dirs under quiesce in time (set state now=%s)",
+                qs_state_after,
+            )
+            return 1
+        if pause_result is False:
+            if qs_state_after != "QUIESCED":
+                log.error(
+                    "IO count rose after quiesce left QUIESCED (state=%s); pause check unreliable past expiration",
+                    qs_state_after,
+                )
+            else:
+                log.error("IO did not pause while quiesce set was QUIESCED")
+            return 1
         if qs_state_after != "QUIESCED":
             log.error(
-                "IO count rose after quiesce left QUIESCED "
-                f"(state={qs_state_after}); pause check unreliable past expiration"
+                "Quiesce set left QUIESCED during IO pause check (state=%s)",
+                qs_state_after,
+            )
+            return 1
+
+        # num_caps drop not asserted under quiesce: write-only revoke (MDS/dev).
+        session_after = find_client_session(
+            client, fs_util, fs_name, subvol_path, mnt_client
+        )
+        if not session_after:
+            log.warning(
+                "Could not re-locate client session after quiesce for num_caps logging"
             )
         else:
-            log.error("IO did not pause while quiesce set was QUIESCED")
+            caps_after_quiesce = session_after["num_caps"]
+            log.info(
+                "num_caps before quiesce: %s, after QUIESCED+IO pause: %s (informational; write-only revoke, drop not required)",
+                caps_before_quiesce,
+                caps_after_quiesce,
+            )
+        return 0
+    finally:
         safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
-        return 1
-    if qs_state_after != "QUIESCED":
-        log.error(
-            f"Quiesce set left QUIESCED during IO pause check (state={qs_state_after})"
-        )
-        safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
-        return 1
-
-    session_after = find_client_session(
-        client, fs_util, fs_name, subvol_path, mnt_client
-    )
-    if session_after is None or session_after == "ambiguous":
-        log.warning(
-            "Could not re-locate client session after quiesce for num_caps logging"
-        )
-    else:
-        caps_after_quiesce = session_after["num_caps"]
-        log.info(
-            f"num_caps before quiesce: {caps_before_quiesce}, "
-            f"after QUIESCED+IO pause: {caps_after_quiesce} "
-            f"(informational; write-only revoke, drop not required)"
-        )
-
-    safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
-    return 0
 
 
 def client_caps_mds_failover_test(
@@ -423,13 +490,14 @@ def client_caps_mds_failover_test(
     session_before = find_client_session(
         client, fs_util, fs_name, subvol_path, mnt_client
     )
-    if session_before is None or session_before == "ambiguous":
+    if not session_before:
         log.error("Failed to locate unique client session before MDS failover")
         return 1
     caps_before_mds_fail = session_before["num_caps"]
     log.info(
-        f"Before MDS fail: client_id={session_before['id']}, "
-        f"num_caps={caps_before_mds_fail}"
+        "Before MDS fail: client_id=%s, num_caps=%s",
+        session_before["id"],
+        caps_before_mds_fail,
     )
 
     log.info("Perform MDS failover")
@@ -443,20 +511,21 @@ def client_caps_mds_failover_test(
         session_after = find_client_session(
             client, fs_util, fs_name, subvol_path, mnt_client
         )
-        if session_after and session_after != "ambiguous":
+        if session_after:
             break
-        log.info(f"Client session not found after failover, retry {attempt + 1}/3")
+        log.info("Client session not found after failover, retry %s/3", attempt + 1)
         time.sleep(30)
 
-    if session_after is None or session_after == "ambiguous":
+    if not session_after:
         log.error("Failed to locate client session after MDS failover")
         return 1
 
     caps_after_mds_fail = session_after["num_caps"]
     log.info(
-        f"Client Caps Before MDS fail:{caps_before_mds_fail},"
-        f"Clients Caps After MDS fail:{caps_after_mds_fail} "
-        f"(client_id after={session_after['id']})"
+        "Client Caps Before MDS fail:%s,Clients Caps After MDS fail:%s (client_id after=%s)",
+        caps_before_mds_fail,
+        caps_after_mds_fail,
+        session_after["id"],
     )
     if caps_after_mds_fail >= caps_before_mds_fail:
         log.error("Clients caps are not updated during MDS failover")
@@ -464,12 +533,17 @@ def client_caps_mds_failover_test(
     return 0
 
 
-def client_caps_evict_test(client, subvol_path, mnt_client, mnt_pt, fs_name, fs_util):
+def client_caps_evict_test(
+    client, subvol_path, mnt_client, mnt_pt, fs_name, fs_util, mnt_info, sv_name
+):
     """
-    This is method for Test3: Client caps validation when client evicted
+    Test3: Client session removed after eviction.
+
+    Remount is cleanup/recovery only (not the pass/fail). New mount path is
+    written back to mnt_info so finally umounts the live mount.
     """
     session = find_client_session(client, fs_util, fs_name, subvol_path, mnt_client)
-    if session is None or session == "ambiguous":
+    if not session:
         log.error("Failed to locate unique client session before eviction")
         return 1
 
@@ -477,31 +551,46 @@ def client_caps_evict_test(client, subvol_path, mnt_client, mnt_pt, fs_name, fs_
     mds_name = session["mds"]
     caps_before_evict = session["num_caps"]
     log.info(
-        f"Evicting Client with ID : {client_id} on mds.{mds_name} "
-        f"(num_caps={caps_before_evict})"
+        "Evicting Client with ID : %s on mds.%s (num_caps=%s)",
+        client_id,
+        mds_name,
+        caps_before_evict,
     )
     cmd = f"ceph tell mds.{mds_name} client evict id={client_id}"
-    client.exec_command(sudo=True, cmd=cmd)
-    time.sleep(2)
+    client.exec_command(sudo=True, cmd=cmd, timeout=120)
 
-    if client_session_exists(client, fs_util, fs_name, client_id):
-        log.error(f"Client session id={client_id} still present after eviction")
+    session_gone = False
+    for attempt in range(12):
+        if not client_session_exists(client, fs_util, fs_name, client_id):
+            session_gone = True
+            break
+        log.info(
+            "Session %s still present after evict, attempt %s/12",
+            client_id,
+            attempt + 1,
+        )
+        time.sleep(5)
+    if not session_gone:
+        log.error("Client session id=%s still present after eviction", client_id)
         return 1
     log.info(
-        f"Client session id={client_id} removed after eviction "
-        f"(caps before evict were {caps_before_evict})"
+        "Client session id=%s removed after eviction (caps before evict were %s)",
+        client_id,
+        caps_before_evict,
     )
 
-    log.info(f"Unmount and Remount {subvol_path} as Client session was evicted")
-    mnt_client.exec_command(sudo=True, cmd=f"umount -l {mnt_pt}")
+    log.info("Unmount and Remount %s as Client session was evicted", subvol_path)
+    mnt_client.exec_command(sudo=True, cmd=f"umount -l {mnt_pt}", check_ec=False)
     mnt_params = {
         "mnt_path": subvol_path,
         "client": mnt_client,
         "fs_util": fs_util,
         "fs_name": fs_name,
+        "export_created": 0,
     }
-    mnt_params.update({"export_created": 0})
-    fs_util.mount_ceph("fuse", mnt_params)
+    new_path, _ = fs_util.mount_ceph("fuse", mnt_params)
+    mnt_info[sv_name]["path"] = new_path
+    log.info("Updated mnt_info[%s] path after remount: %s", sv_name, new_path)
     return 0
 
 
@@ -519,7 +608,7 @@ def mds_failover(cephfs_common_utils, client, fs_name):
         if (mds["state"] == "active") and (mds["rank"] == 0)
     ]
     active_mds = active_mds_list[0]
-    log.info(f"FS status before MDS failover:{output}")
+    log.info("FS status before MDS failover:%s", output)
     out, rc = client.exec_command(cmd=f"ceph mds fail {active_mds}", client_exec=True)
     log.info(out)
     time.sleep(5)
@@ -565,11 +654,11 @@ def wait_for_two_active_mds(client, fs_name, max_wait_time=180, retry_interval=1
 
 def run(ceph_cluster, **kw):
     """
-    CEPH-83597462 - Verify client behavior during CG quiesce, MDS failover, and evict.
+    CEPH-83597462 - CG quiesce IO freeze, MDS failover caps, and client eviction.
 
     Test Steps:
     1. CG quiesce: set reaches QUIESCED and IO on those paths pauses
-       (num_caps logged only; write-only revoke, drop not required)
+       (aggregate num_caps logged only; write-only revoke, drop not required)
     2. MDS failover: client session num_caps decreases after failover
     3. Evict: client session id is removed from MDS client ls
 
@@ -616,7 +705,7 @@ def run(ceph_cluster, **kw):
         mon_node_ip = ",".join(mon_node_ip)
 
         crash_status_before = fs_util_v1.get_crash_ls_new(client)
-        log.info(f"Crash status before Test: {crash_status_before}")
+        log.info("Crash status before Test: %s", crash_status_before)
 
         log.info("Setup test configuration")
         setup_params = test_setup(fs_util_v1, ceph_cluster, client)
@@ -666,7 +755,9 @@ def run(ceph_cluster, **kw):
         test_fail = 0
 
         log.info("Test1: CG quiesce reaches QUIESCED and IO on those paths pauses")
-        io_threads, io_targets = run_io_local(fs_util_v1, mnt_info, sv_list, wait=False)
+        io_threads, io_targets, io_error_slots = run_io_local(
+            fs_util_v1, mnt_info, sv_list, wait=False
+        )
         time.sleep(5)
 
         sv_name = random.choice(sv_name_list)
@@ -688,8 +779,10 @@ def run(ceph_cluster, **kw):
         ):
             test_fail += 1
 
-        for t in io_threads:
-            t.join(timeout=300)
+        # Quiesce may leave writers blocked; bound join then fail if stuck/errored.
+        if join_io_threads(io_threads, io_error_slots, timeout=300) == 1:
+            log.error("Test1 background IO threads failed or did not finish")
+            test_fail += 1
 
         run_io_local(fs_util_v1, mnt_info, sv_list)
 
@@ -721,7 +814,14 @@ def run(ceph_cluster, **kw):
         mnt_client = mnt_info[sv_name]["client"]
         if (
             client_caps_evict_test(
-                client, subvol_path, mnt_client, mnt_pt, fs_name, fs_util_v1
+                client,
+                subvol_path,
+                mnt_client,
+                mnt_pt,
+                fs_name,
+                fs_util_v1,
+                mnt_info,
+                sv_name,
             )
             == 1
         ):
@@ -730,7 +830,11 @@ def run(ceph_cluster, **kw):
         if test_fail > 0:
             log.error("FAIL:Client Caps Validation Test Failed")
             return 1
-        log.info("PASS:Client Caps Validation Test Passed")
+        mount_summary = {name: info["path"] for name, info in mnt_info.items()}
+        log.info(
+            "PASS: quiesce IO freeze + MDS failover caps + evict session gone | mounts=%s",
+            mount_summary,
+        )
         return 0
 
     except Exception as e:
@@ -743,7 +847,7 @@ def run(ceph_cluster, **kw):
             log.error("Skipping cleanup; setup did not complete")
         else:
             crash_status_after = fs_util_v1.get_crash_ls_new(client)
-            log.info(f"Crash status after Test: {crash_status_after}")
+            log.info("Crash status after Test: %s", crash_status_after)
             wait_time_secs = 300
             if cephfs_common_utils.wait_for_healthy_ceph(client, wait_time_secs):
                 log.error("Cluster health is not OK even after waiting for sometime")
