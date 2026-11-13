@@ -4,7 +4,7 @@ import shlex
 import string
 import time
 import traceback
-from threading import Thread
+from threading import Event, Lock, Thread
 
 from ceph.ceph import CommandFailed
 from tests.cephfs.cephfs_utilsV1 import FsUtils as FsUtilsV1
@@ -133,38 +133,24 @@ def join_io_threads(write_procs, io_error_slots, timeout=600):
 
 def run_io_local(fs_util, mnt_info, sv_list, wait=True, join_timeout=600):
     """
-    This methods runs IOs in parallel on given mountpoints.
-    mnt_info : dict type input, with below format,
-    {
-    sv_name:{'path' : path,'client':client}
-    }
-    If wait=False, returns without joining.
-    Returns: (write_procs, io_targets, io_error_slots) where io_targets is a
-    list of {'client': client, 'path': io_path} and io_error_slots[i][0] is set
-    if thread i raised.
+    Warmup IO for Test2/Test3 via fs_util.run_ios (unchanged shared helper).
+
+    Returns: (write_procs, io_error_slots)
     """
     write_procs = []
-    io_targets = []
     io_error_slots = []
     rand_str = "".join(random.choice(string.digits) for i in range(3))
     for sv in sv_list:
         sv_name = sv["subvol_name"]
         mnt_path = mnt_info[sv_name]["path"]
         mnt_client = mnt_info[sv_name]["client"]
-        io_tools = ["smallfile"]
         io_path = f"{mnt_path}/run_ios_{rand_str}"
         mnt_client.exec_command(sudo=True, cmd=f"mkdir -p {io_path}")
-        io_targets.append({"client": mnt_client, "path": io_path})
         err_slot = [None]
 
-        def _io_target(
-            client=mnt_client,
-            path=io_path,
-            tools=io_tools,
-            slot=err_slot,
-        ):
+        def _io_target(client=mnt_client, path=io_path, slot=err_slot):
             try:
-                fs_util.run_ios(client, path, tools)
+                fs_util.run_ios(client, path, ["smallfile"])
             except Exception as exc:
                 log.error("IO thread failed on %s: %s", path, exc)
                 log.error(traceback.format_exc())
@@ -180,88 +166,110 @@ def run_io_local(fs_util, mnt_info, sv_list, wait=True, join_timeout=600):
                 "Background IO threads failed or timed out: "
                 f"{[slot[0] for slot in io_error_slots]}"
             )
-    return write_procs, io_targets, io_error_slots
+    return write_procs, io_error_slots
 
 
-def get_io_file_count(mnt_client, io_path, cmd_timeout=30):
+def start_quiesce_io(mnt_info, sv_list):
     """
-    Return number of regular files under io_path, or None if sampling fails.
+    Test1-only: background smallfile *create* loops (local to this module).
 
-    Bound the remote find: under CG quiesce, unbounded find can stall until the
-    cephci SSH default (600s), past quiesce expiration, and produce false
-    "IO progressed" after the set expires.
-
-    Exit status lives on mnt_client.node (CephObject.exec_command is a proxy).
+    Each successful create completion increments an in-process counter. Under
+    CG quiesce, create exec_command blocks, so the counter must not rise.
+    Does not call cephfs_utilsV1.run_ios and does not find() on CephFS.
     """
-    # pipefail so timeout/find failures are not masked by wc exiting 0
-    inner = f"find {shlex.quote(io_path)} -type f 2>/dev/null | wc -l"
-    cmd = f"timeout {cmd_timeout} bash -o pipefail -c {shlex.quote(inner)}"
-    out, err = mnt_client.exec_command(
-        sudo=True, cmd=cmd, timeout=cmd_timeout + 15, check_ec=False
-    )
-    exit_status = mnt_client.node.exit_status
-    if exit_status != 0:
-        log.warning(
-            "IO file count failed for %s: exit=%s err=%s",
-            io_path,
-            exit_status,
-            str(err).strip() if err else "",
-        )
-        return None
-    try:
-        return int(str(out).strip())
-    except (TypeError, ValueError):
-        log.warning("IO file count parse failed for %s: out=%r", io_path, out)
-        return None
+    write_procs = []
+    io_error_slots = []
+    io_progress = {"completions": 0}
+    lock = Lock()
+    stop_event = Event()
+    rand_str = "".join(random.choice(string.digits) for _ in range(3))
+
+    for sv in sv_list:
+        sv_name = sv["subvol_name"]
+        mnt_path = mnt_info[sv_name]["path"]
+        mnt_client = mnt_info[sv_name]["client"]
+        io_path = f"{mnt_path}/run_ios_{rand_str}"
+        err_slot = [None]
+
+        def _create_loop(
+            client=mnt_client,
+            path=io_path,
+            slot=err_slot,
+            tag=sv_name,
+        ):
+            sync_dir = f"/var/tmp/smallfile_caps_{rand_str}_{tag}"
+            try:
+                client.exec_command(
+                    sudo=True,
+                    cmd=f"mkdir -p {shlex.quote(path)} {shlex.quote(sync_dir)}",
+                )
+                while not stop_event.is_set():
+                    cmd = (
+                        "python3 /home/cephuser/smallfile/smallfile_cli.py "
+                        "--operation create --threads 4 --file-size 1024 "
+                        f"--files 5 --top {shlex.quote(path)} "
+                        f"--network-sync-dir {shlex.quote(sync_dir)}"
+                    )
+                    try:
+                        client.exec_command(sudo=True, cmd=cmd, timeout=600)
+                    except Exception as exc:
+                        if stop_event.is_set():
+                            break
+                        log.error("Quiesce IO create failed on %s: %s", path, exc)
+                        log.error(traceback.format_exc())
+                        slot[0] = exc
+                        break
+                    with lock:
+                        io_progress["completions"] += 1
+            finally:
+                try:
+                    client.exec_command(
+                        sudo=True,
+                        cmd=f"rm -rf {shlex.quote(sync_dir)}",
+                        check_ec=False,
+                    )
+                except Exception:
+                    pass
+
+        proc = Thread(target=_create_loop)
+        io_error_slots.append(err_slot)
+        proc.start()
+        write_procs.append(proc)
+
+    return write_procs, io_error_slots, io_progress, lock, stop_event
 
 
-def verify_io_paused(io_targets, duration=20, interval=5):
+def verify_io_completions_paused(io_progress, lock, duration=20, interval=5):
     """
-    While quiesced, file counts under IO dirs must not increase.
+    While QUIESCED, successful writer completions must not increase.
 
-    Returns:
-        True  — no progress over the settle window
-        False — progress detected
-        None  — could not sample one or more IO dirs in time
+    Uses the in-process counter from start_quiesce_io (no CephFS find/ls).
+    Returns True if paused, False if completions increased.
     """
-    baselines = []
-    for target in io_targets:
-        count = get_io_file_count(target["client"], target["path"])
-        if count is None:
-            log.error("Could not sample IO baseline for %s", target["path"])
-            return None
-        baselines.append(count)
-        log.info("IO baseline file count for %s: %s", target["path"], count)
+    with lock:
+        baseline = io_progress["completions"]
+    log.info("IO completion baseline under quiesce: %s", baseline)
 
     elapsed = 0
     while elapsed < duration:
         time.sleep(interval)
         elapsed += interval
-        for idx, target in enumerate(io_targets):
-            current = get_io_file_count(target["client"], target["path"])
-            if current is None:
-                log.error(
-                    "Could not sample IO count for %s after %ss",
-                    target["path"],
-                    elapsed,
-                )
-                return None
-            log.info(
-                "IO file count after %ss for %s: %s (baseline %s)",
-                elapsed,
-                target["path"],
+        with lock:
+            current = io_progress["completions"]
+        log.info(
+            "IO completions after %ss: %s (baseline %s)",
+            elapsed,
+            current,
+            baseline,
+        )
+        if current > baseline:
+            log.error(
+                "IO completions increased during quiesce: %s -> %s",
+                baseline,
                 current,
-                baselines[idx],
             )
-            if current > baselines[idx]:
-                log.error(
-                    "IO progressed during quiesce on %s: %s -> %s",
-                    target["path"],
-                    baselines[idx],
-                    current,
-                )
-                return False
-    log.info("IO made no progress during quiesce settle window")
+            return False
+    log.info("IO made no progress during quiesce settle window (completions)")
     return True
 
 
@@ -386,11 +394,12 @@ def client_caps_quiesce_test(
     cg_snap_util,
     fs_util,
     mnt_client,
-    io_targets,
     io_threads,
+    io_progress,
+    io_lock,
 ):
     """
-    Test1: CG quiesce — pass on QUIESCED + IO pause.
+    Test1: CG quiesce — pass on QUIESCED + no writer completions.
 
     Intentional change: aggregate client ls num_caps is not a pass/fail check.
     Quiesce revokes write caps only; num_caps need not decrease (MDS/dev).
@@ -432,22 +441,19 @@ def client_caps_quiesce_test(
             return 1
 
         # Keep settle well inside quiesce expiration (default 600s).
-        pause_result = verify_io_paused(io_targets, duration=20, interval=5)
+        pause_ok = verify_io_completions_paused(
+            io_progress, io_lock, duration=20, interval=5
+        )
         qs_state_after = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
         log.info(
             "Quiesce set %s state after IO pause check: %s", qs_id_val, qs_state_after
         )
 
-        if pause_result is None:
-            log.error(
-                "Could not sample IO dirs under quiesce in time (set state now=%s)",
-                qs_state_after,
-            )
-            return 1
-        if pause_result is False:
+        if not pause_ok:
             if qs_state_after != "QUIESCED":
                 log.error(
-                    "IO count rose after quiesce left QUIESCED (state=%s); pause check unreliable past expiration",
+                    "IO completions rose after quiesce left QUIESCED "
+                    "(state=%s); pause check unreliable past expiration",
                     qs_state_after,
                 )
             else:
@@ -471,7 +477,8 @@ def client_caps_quiesce_test(
         else:
             caps_after_quiesce = session_after["num_caps"]
             log.info(
-                "num_caps before quiesce: %s, after QUIESCED+IO pause: %s (informational; write-only revoke, drop not required)",
+                "num_caps before quiesce: %s, after QUIESCED+IO pause: %s "
+                "(informational; write-only revoke, drop not required)",
                 caps_before_quiesce,
                 caps_after_quiesce,
             )
@@ -657,7 +664,7 @@ def run(ceph_cluster, **kw):
     CEPH-83597462 - CG quiesce IO freeze, MDS failover caps, and client eviction.
 
     Test Steps:
-    1. CG quiesce: set reaches QUIESCED and IO on those paths pauses
+    1. CG quiesce: set reaches QUIESCED and writer completions pause
        (aggregate num_caps logged only; write-only revoke, drop not required)
     2. MDS failover: client session num_caps decreases after failover
     3. Evict: client session id is removed from MDS client ls
@@ -754,11 +761,18 @@ def run(ceph_cluster, **kw):
 
         test_fail = 0
 
-        log.info("Test1: CG quiesce reaches QUIESCED and IO on those paths pauses")
-        io_threads, io_targets, io_error_slots = run_io_local(
-            fs_util_v1, mnt_info, sv_list, wait=False
-        )
+        log.info("Test1: CG quiesce reaches QUIESCED and writer completions pause")
+        (
+            io_threads,
+            io_error_slots,
+            io_progress,
+            io_lock,
+            io_stop,
+        ) = start_quiesce_io(mnt_info, sv_list)
         time.sleep(5)
+        with io_lock:
+            pre_q = io_progress["completions"]
+        log.info("IO completions before quiesce: %s", pre_q)
 
         sv_name = random.choice(sv_name_list)
         subvol_path = sv_path_dict[sv_name]
@@ -772,14 +786,16 @@ def run(ceph_cluster, **kw):
                 cg_snap_util,
                 fs_util_v1,
                 mnt_client,
-                io_targets,
                 io_threads,
+                io_progress,
+                io_lock,
             )
             == 1
         ):
             test_fail += 1
 
-        # Quiesce may leave writers blocked; bound join then fail if stuck/errored.
+        io_stop.set()
+        # After release, blocked creates should finish; then threads exit.
         if join_io_threads(io_threads, io_error_slots, timeout=300) == 1:
             log.error("Test1 background IO threads failed or did not finish")
             test_fail += 1
