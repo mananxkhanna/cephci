@@ -169,6 +169,31 @@ def run_io_local(fs_util, mnt_info, sv_list, wait=True, join_timeout=600):
     return write_procs, io_error_slots
 
 
+def _io_progress_snapshot(io_progress):
+    """Copy of counters/in-flight map for logging (caller holds lock)."""
+    return {
+        "completions": io_progress["completions"],
+        "in_flight": dict(io_progress["in_flight"]),
+        "started": io_progress["started"],
+        "finished": io_progress["finished"],
+    }
+
+
+def log_io_progress(prefix, io_progress, lock):
+    """Log create-loop counters; grep logs for [quiesce-io]."""
+    with lock:
+        snap = _io_progress_snapshot(io_progress)
+    log.info(
+        "[quiesce-io] %s completions=%s started=%s finished=%s in_flight=%s",
+        prefix,
+        snap["completions"],
+        snap["started"],
+        snap["finished"],
+        snap["in_flight"],
+    )
+    return snap
+
+
 def start_quiesce_io(mnt_info, sv_list):
     """
     Test1-only: background smallfile *create* loops (local to this module).
@@ -179,10 +204,17 @@ def start_quiesce_io(mnt_info, sv_list):
     """
     write_procs = []
     io_error_slots = []
-    io_progress = {"completions": 0}
+    # in_flight[tag] = batch seq currently inside exec_command, or None
+    io_progress = {
+        "completions": 0,
+        "started": 0,
+        "finished": 0,
+        "in_flight": {},
+    }
     lock = Lock()
     stop_event = Event()
     rand_str = "".join(random.choice(string.digits) for _ in range(3))
+    t0 = time.monotonic()
 
     for sv in sv_list:
         sv_name = sv["subvol_name"]
@@ -190,6 +222,8 @@ def start_quiesce_io(mnt_info, sv_list):
         mnt_client = mnt_info[sv_name]["client"]
         io_path = f"{mnt_path}/run_ios_{rand_str}"
         err_slot = [None]
+        with lock:
+            io_progress["in_flight"][sv_name] = None
 
         def _create_loop(
             client=mnt_client,
@@ -210,18 +244,71 @@ def start_quiesce_io(mnt_info, sv_list):
                         f"--files 5 --top {shlex.quote(path)} "
                         f"--network-sync-dir {shlex.quote(sync_dir)}"
                     )
+                    with lock:
+                        io_progress["started"] += 1
+                        batch = io_progress["started"]
+                        io_progress["in_flight"][tag] = batch
+                    log.info(
+                        "[quiesce-io] CREATE_START sv=%s batch=%s path=%s "
+                        "t+%.3fs stop=%s",
+                        tag,
+                        batch,
+                        path,
+                        time.monotonic() - t0,
+                        stop_event.is_set(),
+                    )
+                    start_mono = time.monotonic()
                     try:
                         client.exec_command(sudo=True, cmd=cmd, timeout=600)
                     except Exception as exc:
+                        elapsed = time.monotonic() - start_mono
+                        with lock:
+                            io_progress["in_flight"][tag] = None
                         if stop_event.is_set():
+                            log.info(
+                                "[quiesce-io] CREATE_ABORT sv=%s batch=%s "
+                                "after %.3fs (stop set): %s",
+                                tag,
+                                batch,
+                                elapsed,
+                                exc,
+                            )
                             break
-                        log.error("Quiesce IO create failed on %s: %s", path, exc)
+                        log.error(
+                            "[quiesce-io] CREATE_FAIL sv=%s batch=%s after %.3fs: %s",
+                            tag,
+                            batch,
+                            elapsed,
+                            exc,
+                        )
                         log.error(traceback.format_exc())
                         slot[0] = exc
                         break
+                    elapsed = time.monotonic() - start_mono
                     with lock:
+                        io_progress["finished"] += 1
                         io_progress["completions"] += 1
+                        io_progress["in_flight"][tag] = None
+                        completions = io_progress["completions"]
+                    log.info(
+                        "[quiesce-io] CREATE_DONE sv=%s batch=%s path=%s "
+                        "took=%.3fs completions=%s t+%.3fs stop=%s",
+                        tag,
+                        batch,
+                        path,
+                        elapsed,
+                        completions,
+                        time.monotonic() - t0,
+                        stop_event.is_set(),
+                    )
             finally:
+                with lock:
+                    io_progress["in_flight"][tag] = None
+                log.info(
+                    "[quiesce-io] writer exit sv=%s t+%.3fs",
+                    tag,
+                    time.monotonic() - t0,
+                )
                 try:
                     client.exec_command(
                         sudo=True,
@@ -231,10 +318,16 @@ def start_quiesce_io(mnt_info, sv_list):
                 except Exception:
                     pass
 
-        proc = Thread(target=_create_loop)
+        proc = Thread(target=_create_loop, name=f"quiesce-io-{sv_name}")
         io_error_slots.append(err_slot)
         proc.start()
         write_procs.append(proc)
+        log.info(
+            "[quiesce-io] started writer thread=%s sv=%s path=%s",
+            proc.name,
+            sv_name,
+            io_path,
+        )
 
     return write_procs, io_error_slots, io_progress, lock, stop_event
 
@@ -246,30 +339,30 @@ def verify_io_completions_paused(io_progress, lock, duration=20, interval=5):
     Uses the in-process counter from start_quiesce_io (no CephFS find/ls).
     Returns True if paused, False if completions increased.
     """
-    with lock:
-        baseline = io_progress["completions"]
-    log.info("IO completion baseline under quiesce: %s", baseline)
+    baseline_snap = log_io_progress("baseline under QUIESCED", io_progress, lock)
+    baseline = baseline_snap["completions"]
 
     elapsed = 0
     while elapsed < duration:
         time.sleep(interval)
         elapsed += interval
-        with lock:
-            current = io_progress["completions"]
-        log.info(
-            "IO completions after %ss: %s (baseline %s)",
-            elapsed,
-            current,
-            baseline,
-        )
+        snap = log_io_progress(f"pause sample after {elapsed}s", io_progress, lock)
+        current = snap["completions"]
         if current > baseline:
             log.error(
-                "IO completions increased during quiesce: %s -> %s",
+                "[quiesce-io] completions rose under QUIESCED: %s -> %s "
+                "(in_flight=%s); new CREATE_DONE after baseline",
                 baseline,
                 current,
+                snap["in_flight"],
             )
             return False
-    log.info("IO made no progress during quiesce settle window (completions)")
+    log.info(
+        "[quiesce-io] no completion progress during settle window "
+        "(baseline=%s in_flight=%s)",
+        baseline,
+        baseline_snap["in_flight"],
+    )
     return True
 
 
@@ -417,6 +510,7 @@ def client_caps_quiesce_test(
     )
 
     log.info("CG quiesce on members:%s", qs_set)
+    log_io_progress("before cg_quiesce --await", io_progress, io_lock)
     rand_str = "".join(random.choice(string.digits) for i in range(3))
     qs_id_val = f"caps_test_{rand_str}"
     qs_out = cg_snap_util.cg_quiesce(
@@ -428,6 +522,7 @@ def client_caps_quiesce_test(
 
     # Always release once quiesce succeeded (covers early returns and exceptions).
     try:
+        log_io_progress("right after cg_quiesce returned", io_progress, io_lock)
         qs_state = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
         log.info("Quiesce set %s state after await: %s", qs_id_val, qs_state)
         if qs_state != "QUIESCED":
@@ -439,6 +534,13 @@ def client_caps_quiesce_test(
                 "IO threads finished before quiesce validation; cannot verify pause"
             )
             return 1
+        for idx, thr in enumerate(io_threads):
+            log.info(
+                "[quiesce-io] thread[%s] name=%s alive=%s",
+                idx,
+                thr.name,
+                thr.is_alive(),
+            )
 
         # Keep settle well inside quiesce expiration (default 600s).
         pause_ok = verify_io_completions_paused(
@@ -448,6 +550,7 @@ def client_caps_quiesce_test(
         log.info(
             "Quiesce set %s state after IO pause check: %s", qs_id_val, qs_state_after
         )
+        log_io_progress("after pause check / before release", io_progress, io_lock)
 
         if not pause_ok:
             if qs_state_after != "QUIESCED":
@@ -484,7 +587,9 @@ def client_caps_quiesce_test(
             )
         return 0
     finally:
+        log_io_progress("entering release finally", io_progress, io_lock)
         safe_quiesce_release(cg_snap_util, client, qs_id_val, fs_name)
+        log_io_progress("after release finally", io_progress, io_lock)
 
 
 def client_caps_mds_failover_test(
@@ -770,9 +875,7 @@ def run(ceph_cluster, **kw):
             io_stop,
         ) = start_quiesce_io(mnt_info, sv_list)
         time.sleep(5)
-        with io_lock:
-            pre_q = io_progress["completions"]
-        log.info("IO completions before quiesce: %s", pre_q)
+        log_io_progress("after 5s warmup, before Test1 quiesce", io_progress, io_lock)
 
         sv_name = random.choice(sv_name_list)
         subvol_path = sv_path_dict[sv_name]
@@ -794,11 +897,14 @@ def run(ceph_cluster, **kw):
         ):
             test_fail += 1
 
+        log_io_progress("before stop_event (post release)", io_progress, io_lock)
         io_stop.set()
+        log.info("[quiesce-io] stop_event set")
         # After release, blocked creates should finish; then threads exit.
         if join_io_threads(io_threads, io_error_slots, timeout=300) == 1:
             log.error("Test1 background IO threads failed or did not finish")
             test_fail += 1
+        log_io_progress("after Test1 IO join", io_progress, io_lock)
 
         run_io_local(fs_util_v1, mnt_info, sv_list)
 
