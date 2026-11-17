@@ -147,31 +147,21 @@ def _apply_nfs_spec(installer, hosts, cluster, nfs_nodes=None):
 def _nfs_orch_exists(installer, service_id):
     """True if orch still lists nfs.<id>.
 
-    Prefer ``[]`` with rc 0 for a missing service. If the build returns
-    non-zero with ``No services reported``, treat that as gone. Other
-    failures raise so wait loops do not false-pass.
+    Missing service may return JSON ``[]`` or plain ``No services reported``
+    (often with rc 0). Treat both as gone; other unparsable output raises.
     """
     svc = shlex.quote(f"nfs.{service_id}")
-    cmd = f"ceph orch ls --service-name {svc} --format json"
-    try:
-        out, err = _ceph(installer, cmd, check_ec=True)
-    except Exception:
-        out, err = _ceph(installer, cmd, check_ec=False)
-        text = "\n".join(p for p in (out, err) if p)
-        if re.search(r"No services reported", text, re.I):
-            return False
-        data = _first_json(out, "[")
-        if data is not None:
-            return bool(data)
-        raise OperationFailedError(
-            f"orch ls nfs.{service_id}: failed and unparsable:\n{text}"
-        )
+    out, err = _ceph(
+        installer,
+        f"ceph orch ls --service-name {svc} --format json",
+        check_ec=False,
+    )
     data = _first_json(out, "[")
-    if data is None:
-        raise OperationFailedError(
-            f"orch ls nfs.{service_id}: unparsable output:\n{out}"
-        )
-    return bool(data)
+    if data is not None:
+        return bool(data)
+    if re.search(r"No services reported", "\n".join((out, err)), re.I):
+        return False
+    raise OperationFailedError(f"orch ls nfs.{service_id}: unparsable:\n{out}\n{err}")
 
 
 def _rados_ls(installer, namespace):
