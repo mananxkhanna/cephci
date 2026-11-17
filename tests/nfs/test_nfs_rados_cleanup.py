@@ -295,10 +295,11 @@ def _wait_daemons_gone(installer, service_id):
 def _orch_rm_nfs(installer, service_id):
     name = f"nfs.{service_id}"
     log.info("ceph orch rm %s", name)
-    # check_ec=False: capture warning text even if orch wraps non-zero oddly.
+    # check_ec=False: always capture warning text; log rc via exit_status (F4).
     out, err = _ceph(installer, f"ceph orch rm {shlex.quote(name)}", check_ec=False)
+    rc = installer.exit_status
     text = "\n".join(p for p in (out, err) if p)
-    log.info("orch rm output:\n%s", text)
+    log.info("orch rm rc=%s output:\n%s", rc, text)
     for _ in WaitUntil(timeout=ORCH_RM_WAIT, interval=5):
         if not _nfs_orch_exists(installer, service_id):
             log.info("Removed orch service nfs.%s", service_id)
@@ -343,18 +344,16 @@ def _cleanup_cluster(installer, service_id):
     """Idempotent teardown; leave nfs.<id> gone and namespace empty for next row.
 
     Always try ``nfs cluster rm`` so post-orch-rm RADOS orphans still take the
-    product cleanup path (mgr may omit the id from ``nfs cluster ls``). Treat
-    "Cluster does not exist" as expected when already cleaned.
+    product cleanup path (mgr may omit the id from ``nfs cluster ls``). On
+    umbrella, already-gone prints ``Cluster does not exist`` with rc 0 (no
+    raise); other failures are logged and cleanup continues.
 
     Returns True when cleanup finished cleanly, False on leak / incomplete wipe.
     """
     try:
         _nfs_cluster_rm(installer, service_id)
     except Exception as exc:
-        if re.search(r"Cluster does not exist", str(exc), re.I):
-            log.info("cleanup nfs cluster rm %s: already gone", service_id)
-        else:
-            log.warning("cleanup nfs cluster rm %s: %s", service_id, exc)
+        log.warning("cleanup nfs cluster rm %s: %s", service_id, exc)
     try:
         if _nfs_orch_exists(installer, service_id):
             _orch_rm_nfs(installer, service_id)
