@@ -48,6 +48,7 @@ def run(ceph_cluster, **kw):
     4. Deactivate and remove sanp_Schedule
     5. Remove FS
     """
+    sanp_schedule_list = ["/dir_kernel", "/dir_fuse"]
     try:
         test_data = kw.get("test_data")
         fs_util = FsUtils(ceph_cluster, test_data=test_data)
@@ -176,7 +177,6 @@ def run(ceph_cluster, **kw):
             extra_params=f"--client_fs {default_fs}",
         )
         client1.exec_command(sudo=True, cmd=f"mkdir -p {fuse_mounting_dir_1}/dir_fuse")
-        sanp_schedule_list = ["/dir_kernel", "/dir_fuse"]
         m_granularity = (
             "m" if LooseVersion(ceph_version) >= LooseVersion("17.2.6") else "M"
         )

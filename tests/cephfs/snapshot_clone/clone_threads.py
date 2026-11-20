@@ -77,6 +77,7 @@ def run(ceph_cluster, **kw):
     2. ceph fs subvolume rm <vol_name> <subvol_name> [--group_name <subvol_group_name>]
     3. ceph fs subvolumegroup rm <vol_name> <group_name>
     """
+    snapshot = None
     try:
         test_data = kw.get("test_data")
         fs_util = FsUtils(ceph_cluster, test_data=test_data)
@@ -284,5 +285,6 @@ def run(ceph_cluster, **kw):
                     client1, **clonevolume, force=True, validate=False, check_ec=False
                 )
         log.info("Clean Up in progess")
-        fs_util.remove_snapshot(client1, **snapshot, validate=False, check_ec=False)
+        if snapshot is not None:
+            fs_util.remove_snapshot(client1, **snapshot, validate=False, check_ec=False)
         fs_util.remove_subvolume(client1, **subvolume, validate=False, check_ec=False)
