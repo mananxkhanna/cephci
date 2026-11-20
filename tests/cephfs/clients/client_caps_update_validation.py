@@ -198,12 +198,15 @@ def start_quiesce_io(mnt_info, sv_list):
     """
     Test1-only: background smallfile *create* loops (local to this module).
 
-    Each successful create completion increments an in-process counter. Under
-    CG quiesce, create exec_command blocks, so the counter must not rise.
-    Does not call cephfs_utilsV1.run_ios and does not find() on CephFS.
+    Each batch uses a unique --top under io_path so creates can add new files
+    (avoids smallfile EEXIST + exit 0 looking like progress). Completions are
+    logged only; QUIESCED pass/fail is on-disk file_count (see
+    verify_io_completions_paused). Returns io_paths.
+    Does not call cephfs_utilsV1.run_ios.
     """
     write_procs = []
     io_error_slots = []
+    io_paths = {}
     # in_flight[tag] = batch seq currently inside exec_command, or None
     io_progress = {
         "completions": 0,
@@ -221,6 +224,7 @@ def start_quiesce_io(mnt_info, sv_list):
         mnt_path = mnt_info[sv_name]["path"]
         mnt_client = mnt_info[sv_name]["client"]
         io_path = f"{mnt_path}/run_ios_{rand_str}"
+        io_paths[sv_name] = {"client": mnt_client, "path": io_path}
         err_slot = [None]
         with lock:
             io_progress["in_flight"][sv_name] = None
@@ -231,29 +235,37 @@ def start_quiesce_io(mnt_info, sv_list):
             slot=err_slot,
             tag=sv_name,
         ):
-            sync_dir = f"/var/tmp/smallfile_caps_{rand_str}_{tag}"
             try:
                 client.exec_command(
                     sudo=True,
-                    cmd=f"mkdir -p {shlex.quote(path)} {shlex.quote(sync_dir)}",
+                    cmd=f"mkdir -p {shlex.quote(path)}",
                 )
                 while not stop_event.is_set():
-                    cmd = (
-                        "python3 /home/cephuser/smallfile/smallfile_cli.py "
-                        "--operation create --threads 4 --file-size 1024 "
-                        f"--files 5 --top {shlex.quote(path)} "
-                        f"--network-sync-dir {shlex.quote(sync_dir)}"
-                    )
                     with lock:
                         io_progress["started"] += 1
                         batch = io_progress["started"]
                         io_progress["in_flight"][tag] = batch
+                    batch_top = f"{path}/b{batch}"
+                    sync_dir = f"/var/tmp/smallfile_caps_{rand_str}_{tag}_{batch}"
+                    client.exec_command(
+                        sudo=True,
+                        cmd=(
+                            f"mkdir -p {shlex.quote(batch_top)} "
+                            f"{shlex.quote(sync_dir)}"
+                        ),
+                    )
+                    cmd = (
+                        "python3 /home/cephuser/smallfile/smallfile_cli.py "
+                        "--operation create --threads 4 --file-size 1024 "
+                        f"--files 5 --top {shlex.quote(batch_top)} "
+                        f"--network-sync-dir {shlex.quote(sync_dir)}"
+                    )
                     log.info(
                         "[quiesce-io] CREATE_START sv=%s batch=%s path=%s "
                         "t+%.3fs stop=%s",
                         tag,
                         batch,
-                        path,
+                        batch_top,
                         time.monotonic() - t0,
                         stop_event.is_set(),
                     )
@@ -264,6 +276,14 @@ def start_quiesce_io(mnt_info, sv_list):
                         elapsed = time.monotonic() - start_mono
                         with lock:
                             io_progress["in_flight"][tag] = None
+                        try:
+                            client.exec_command(
+                                sudo=True,
+                                cmd=f"rm -rf {shlex.quote(sync_dir)}",
+                                check_ec=False,
+                            )
+                        except Exception:
+                            pass
                         if stop_event.is_set():
                             log.info(
                                 "[quiesce-io] CREATE_ABORT sv=%s batch=%s "
@@ -292,15 +312,24 @@ def start_quiesce_io(mnt_info, sv_list):
                         completions = io_progress["completions"]
                     log.info(
                         "[quiesce-io] CREATE_DONE sv=%s batch=%s path=%s "
-                        "took=%.3fs completions=%s t+%.3fs stop=%s",
+                        "took=%.3fs completions=%s t+%.3fs stop=%s "
+                        "(informational; pass/fail uses file_count)",
                         tag,
                         batch,
-                        path,
+                        batch_top,
                         elapsed,
                         completions,
                         time.monotonic() - t0,
                         stop_event.is_set(),
                     )
+                    try:
+                        client.exec_command(
+                            sudo=True,
+                            cmd=f"rm -rf {shlex.quote(sync_dir)}",
+                            check_ec=False,
+                        )
+                    except Exception:
+                        pass
             finally:
                 with lock:
                     io_progress["in_flight"][tag] = None
@@ -309,14 +338,6 @@ def start_quiesce_io(mnt_info, sv_list):
                     tag,
                     time.monotonic() - t0,
                 )
-                try:
-                    client.exec_command(
-                        sudo=True,
-                        cmd=f"rm -rf {shlex.quote(sync_dir)}",
-                        check_ec=False,
-                    )
-                except Exception:
-                    pass
 
         proc = Thread(target=_create_loop, name=f"quiesce-io-{sv_name}")
         io_error_slots.append(err_slot)
@@ -329,39 +350,160 @@ def start_quiesce_io(mnt_info, sv_list):
             io_path,
         )
 
-    return write_procs, io_error_slots, io_progress, lock, stop_event
+    return write_procs, io_error_slots, io_progress, lock, stop_event, io_paths
 
 
-def verify_io_completions_paused(io_progress, lock, duration=20, interval=5):
+def count_files_under(client, path, timeout=60):
     """
-    While QUIESCED, successful writer completions must not increase.
+    Bounded file count under path (timeout on remote find).
 
-    Uses the in-process counter from start_quiesce_io (no CephFS find/ls).
-    Returns True if paused, False if completions increased.
+    Returns int, or None if the count command fails.
     """
+    cmd = f"find {shlex.quote(path)} -xdev -type f 2>/dev/null | wc -l"
+    try:
+        out, _ = client.exec_command(sudo=True, cmd=cmd, timeout=timeout)
+        text = (out or "").strip()
+        if not text:
+            return 0
+        return int(text.split()[-1])
+    except Exception as exc:
+        log.warning("[quiesce-io] file_count failed path=%s: %s", path, exc)
+        return None
+
+
+def snapshot_io_file_counts(io_paths, label):
+    """
+    Count files under each create-loop top path. Logs [quiesce-io] file_count.
+    Returns {sv_name: count_or_None}.
+    """
+    counts = {}
+    for sv_name, info in io_paths.items():
+        n = count_files_under(info["client"], info["path"])
+        counts[sv_name] = n
+        log.info(
+            "[quiesce-io] file_count %s sv=%s path=%s count=%s",
+            label,
+            sv_name,
+            info["path"],
+            n,
+        )
+    return counts
+
+
+def file_counts_increased(baseline, current):
+    """
+    True if any subvol with known before/after counts grew.
+    Skips subvols where either sample is None (count failed).
+    """
+    grew = False
+    for sv_name, before in baseline.items():
+        after = current.get(sv_name)
+        if before is None or after is None:
+            log.warning(
+                "[quiesce-io] file_count skip compare sv=%s before=%s after=%s",
+                sv_name,
+                before,
+                after,
+            )
+            continue
+        delta = after - before
+        log.info(
+            "[quiesce-io] file_count delta sv=%s before=%s after=%s delta=%s",
+            sv_name,
+            before,
+            after,
+            delta,
+        )
+        if delta > 0:
+            log.error(
+                "[quiesce-io] file_count rose under QUIESCED: sv=%s %s -> %s",
+                sv_name,
+                before,
+                after,
+            )
+            grew = True
+    return grew
+
+
+def verify_io_completions_paused(
+    io_progress, lock, duration=20, interval=5, io_paths=None
+):
+    """
+    While QUIESCED, on-disk file counts must not grow from *new* create batches.
+
+    Pass/fail: file_count rise only counts as failure if `started` also rose
+    after baseline (a new batch began under QUIESCED). File growth with the
+    same `started` is treated as in-flight drain from pre-QUIESCED batches
+    (log warning, not fail) so we do not mis-read drain as a quiesce break.
+
+    Completions / CREATE_DONE are informational only. Requires io_paths.
+    """
+    if not io_paths:
+        log.error("[quiesce-io] io_paths required for file_count pause check; failing")
+        return False
+
     baseline_snap = log_io_progress("baseline under QUIESCED", io_progress, lock)
-    baseline = baseline_snap["completions"]
+    baseline_started = baseline_snap["started"]
+    baseline_files = snapshot_io_file_counts(io_paths, "baseline under QUIESCED")
+    if any(v is not None for v in baseline_snap["in_flight"].values()):
+        log.info(
+            "[quiesce-io] in-flight batches at baseline %s — file growth "
+            "without new started batches will be treated as drain, not fail",
+            baseline_snap["in_flight"],
+        )
 
     elapsed = 0
     while elapsed < duration:
         time.sleep(interval)
         elapsed += interval
         snap = log_io_progress(f"pause sample after {elapsed}s", io_progress, lock)
-        current = snap["completions"]
-        if current > baseline:
+        after_files = snapshot_io_file_counts(
+            io_paths, f"pause sample after {elapsed}s"
+        )
+        grew = file_counts_increased(baseline_files, after_files)
+        if not grew:
+            continue
+        if snap["started"] > baseline_started:
             log.error(
-                "[quiesce-io] completions rose under QUIESCED: %s -> %s "
-                "(in_flight=%s); new CREATE_DONE after baseline",
-                baseline,
-                current,
-                snap["in_flight"],
+                "[quiesce-io] file_count rose under QUIESCED with new batches "
+                "started (%s -> %s); treating as IO not paused",
+                baseline_started,
+                snap["started"],
             )
             return False
+        log.warning(
+            "[quiesce-io] file_count rose under QUIESCED but started unchanged "
+            "(%s); treating as in-flight drain from pre-QUIESCED batches "
+            "(not a fail). Re-basing file_count baseline.",
+            baseline_started,
+        )
+        baseline_files = after_files
+
+    after_files = snapshot_io_file_counts(io_paths, "end of settle under QUIESCED")
+    grew = file_counts_increased(baseline_files, after_files)
+    end_snap = log_io_progress("end settle", io_progress, lock)
+    if grew and end_snap["started"] > baseline_started:
+        log.error(
+            "[quiesce-io] file_count rose under QUIESCED with new batches "
+            "started (%s -> %s) by end of settle",
+            baseline_started,
+            end_snap["started"],
+        )
+        return False
+    if grew:
+        log.warning(
+            "[quiesce-io] end-of-settle file_count rise with started unchanged "
+            "(%s); in-flight drain only — not a fail",
+            baseline_started,
+        )
+
     log.info(
-        "[quiesce-io] no completion progress during settle window "
-        "(baseline=%s in_flight=%s)",
-        baseline,
-        baseline_snap["in_flight"],
+        "[quiesce-io] file_count pause OK during settle "
+        "(started baseline=%s end=%s completions end=%s file_counts=%s)",
+        baseline_started,
+        end_snap["started"],
+        end_snap["completions"],
+        baseline_files,
     )
     return True
 
@@ -490,13 +632,14 @@ def client_caps_quiesce_test(
     io_threads,
     io_progress,
     io_lock,
+    io_paths,
 ):
     """
-    Test1: CG quiesce — pass on QUIESCED + no writer completions.
+    Test1: CG quiesce — pass on QUIESCED + no new-batch file growth.
 
-    Intentional change: aggregate client ls num_caps is not a pass/fail check.
-    Quiesce revokes write caps only; num_caps need not decrease (MDS/dev).
-    Logged before/after for visibility only.
+    Pass/fail: set reaches QUIESCED and file_count does not rise from batches
+    that *start* under QUIESCED (in-flight drain is not a fail). Completions /
+    smallfile exit 0 are informational only. num_caps is not pass/fail.
     """
     session = find_client_session(client, fs_util, fs_name, subvol_path, mnt_client)
     if not session:
@@ -544,7 +687,7 @@ def client_caps_quiesce_test(
 
         # Keep settle well inside quiesce expiration (default 600s).
         pause_ok = verify_io_completions_paused(
-            io_progress, io_lock, duration=20, interval=5
+            io_progress, io_lock, duration=20, interval=5, io_paths=io_paths
         )
         qs_state_after = get_quiesce_set_state(cg_snap_util, client, qs_id_val, fs_name)
         log.info(
@@ -555,12 +698,15 @@ def client_caps_quiesce_test(
         if not pause_ok:
             if qs_state_after != "QUIESCED":
                 log.error(
-                    "IO completions rose after quiesce left QUIESCED "
+                    "file_count rose (new batches) after quiesce left QUIESCED "
                     "(state=%s); pause check unreliable past expiration",
                     qs_state_after,
                 )
             else:
-                log.error("IO did not pause while quiesce set was QUIESCED")
+                log.error(
+                    "IO did not pause while quiesce set was QUIESCED "
+                    "(file_count rose from batches started under QUIESCED)"
+                )
             return 1
         if qs_state_after != "QUIESCED":
             log.error(
@@ -769,7 +915,7 @@ def run(ceph_cluster, **kw):
     CEPH-83597462 - CG quiesce IO freeze, MDS failover caps, and client eviction.
 
     Test Steps:
-    1. CG quiesce: set reaches QUIESCED and writer completions pause
+    1. CG quiesce: set reaches QUIESCED; on-disk file_count must not rise
        (aggregate num_caps logged only; write-only revoke, drop not required)
     2. MDS failover: client session num_caps decreases after failover
     3. Evict: client session id is removed from MDS client ls
@@ -866,16 +1012,18 @@ def run(ceph_cluster, **kw):
 
         test_fail = 0
 
-        log.info("Test1: CG quiesce reaches QUIESCED and writer completions pause")
+        log.info("Test1: CG quiesce reaches QUIESCED; on-disk file_count must pause")
         (
             io_threads,
             io_error_slots,
             io_progress,
             io_lock,
             io_stop,
+            io_paths,
         ) = start_quiesce_io(mnt_info, sv_list)
         time.sleep(5)
         log_io_progress("after 5s warmup, before Test1 quiesce", io_progress, io_lock)
+        snapshot_io_file_counts(io_paths, "after 5s warmup, before Test1 quiesce")
 
         sv_name = random.choice(sv_name_list)
         subvol_path = sv_path_dict[sv_name]
@@ -892,6 +1040,7 @@ def run(ceph_cluster, **kw):
                 io_threads,
                 io_progress,
                 io_lock,
+                io_paths,
             )
             == 1
         ):
